@@ -337,8 +337,9 @@ class SessionDaemon:
 
     def _dispatch(self, req: dict[str, Any]) -> tuple[dict[str, Any], _Job | None]:
         op = req.get("op")
-        with self.state_lock:
-            self.last_activity = time.monotonic()
+        if op != "ps":
+            with self.state_lock:
+                self.last_activity = time.monotonic()
 
         if op == "exec":
             timeout = float(req.get("timeout", DEFAULT_EXEC_TIMEOUT))
@@ -424,7 +425,9 @@ class SessionDaemon:
                         "state": "running" if running else "idle",
                         "elapsed": job.elapsed if running and job is not None else 0.0,
                         "location": _main_thread_location() if running else None,
-                        "idle_seconds": round(max(0.0, time.monotonic() - self.last_activity), 1),
+                        "idle_seconds": (
+                            0.0 if running else round(max(0.0, time.monotonic() - self.last_activity), 1)
+                        ),
                         "vars": user_vars,
                     },
                     None,
@@ -581,6 +584,23 @@ def _read_code(code_arg: str | None, file_arg: str | None, *, read_stdin_tty_saf
     if read_stdin_tty_safe and sys.stdin.isatty():
         return ""
     return sys.stdin.read()
+
+
+def _format_idle_duration(seconds: float) -> str:
+    """Format an idle duration in whole seconds using compact human units."""
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    if total < 3600:
+        mins, secs = divmod(total, 60)
+        return f"{mins}m{secs}s" if secs else f"{mins}m"
+    if total < 86400:
+        hours, rem = divmod(total, 3600)
+        mins = rem // 60
+        return f"{hours}h{mins}m" if mins else f"{hours}h"
+    days, rem = divmod(total, 86400)
+    hours = rem // 3600
+    return f"{days}d{hours}h" if hours else f"{days}d"
 
 
 def _emit_step_output(session_id: str, resp: dict[str, Any]) -> int:
@@ -752,7 +772,7 @@ def main(argv: list[str] | None = None) -> None:
                 resp = _send_request(args.session_id, {"op": "ps"})
                 print(
                     f"session={resp['id']} pid={resp['pid']} state={resp['state']} "
-                    f"idle={resp['idle_seconds']}s"
+                    f"idle={_format_idle_duration(resp['idle_seconds'])}"
                 )
                 if resp["state"] == "running":
                     loc = f" location={resp['location']}" if resp.get("location") else ""
@@ -775,7 +795,7 @@ def main(argv: list[str] | None = None) -> None:
                     found = True
                     print(
                         f"{resp['id']}\tpid={resp['pid']}\tstate={resp['state']}\t"
-                        f"idle={resp['idle_seconds']}s\tvars={len(resp.get('vars', {}))}"
+                        f"idle={_format_idle_duration(resp['idle_seconds'])}\tvars={len(resp.get('vars', {}))}"
                     )
                 if not found:
                     print("No active sessions.")

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from pysess.cli import _IncrementalBuffer, build_parser, main
+from pysess.cli import _format_idle_duration, _IncrementalBuffer, build_parser, main
 
 
 @pytest.fixture
@@ -365,3 +365,16 @@ def test_invalid_session_id_rejected(runtime_env: dict[str, str]) -> None:
     res = _run_cli("exec", "../traversal", "-c", "1", env=runtime_env)
     assert res.returncode == 1
     assert "Invalid session ID" in res.stderr
+
+
+def test_format_idle_duration() -> None:
+    assert _format_idle_duration(0.0) == "0s"
+    assert _format_idle_duration(0.9) == "0s"
+    assert _format_idle_duration(5.2) == "5s"
+    assert _format_idle_duration(59.9) == "59s"
+    assert _format_idle_duration(60.0) == "1m"
+    assert _format_idle_duration(65.0) == "1m5s"
+    assert _format_idle_duration(3600.0) == "1h"
+    assert _format_idle_duration(3660.0) == "1h1m"
+    assert _format_idle_duration(86400.0) == "1d"
+    assert _format_idle_duration(90000.0) == "1d1h"
