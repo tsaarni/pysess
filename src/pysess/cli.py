@@ -815,14 +815,21 @@ def main(argv: list[str] | None = None) -> None:
             rc = 0
         else:  # kill
             if args.all:
+                killed_any = False
                 for sock_file in sorted(runtime_dir().glob("*.sock")):
                     try:
                         _send_request(sock_file.stem, {"op": "kill"})
                     except RuntimeError:
                         with contextlib.suppress(OSError):
                             sock_file.unlink()
+                        continue
+                    killed_any = True
+                    print(f"Killed session '{sock_file.stem}'.")
+                if not killed_any:
+                    print("No active sessions.")
             else:
                 _send_request(args.session_id, {"op": "kill"})
+                print(f"Killed session '{args.session_id}'.")
             rc = 0
     except (OSError, RuntimeError) as exc:
         print(f"pysess: {exc}", file=sys.stderr)

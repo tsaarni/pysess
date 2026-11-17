@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from pysess.cli import _format_idle_duration, _IncrementalBuffer, build_parser, main
+from pysess.cli import _format_idle_duration, _IncrementalBuffer, build_parser
 
 
 @pytest.fixture
@@ -215,6 +215,11 @@ def test_ps_and_kill_all(runtime_env: dict[str, str]) -> None:
     finally:
         kill_res = _run_cli("kill", "--all", env=runtime_env)
         assert kill_res.returncode == 0
+        assert f"Killed session '{sid}'." in kill_res.stdout
+
+    kill_empty = _run_cli("kill", "--all", env=runtime_env)
+    assert kill_empty.returncode == 0
+    assert "No active sessions." in kill_empty.stdout
 
     ps_empty = _run_cli("ps", env=runtime_env)
     assert ps_empty.returncode == 0
@@ -256,6 +261,7 @@ def test_kill_while_job_is_running(runtime_env: dict[str, str]) -> None:
 
     kill_res = _run_cli("kill", sid, env=runtime_env)
     assert kill_res.returncode == 0
+    assert f"Killed session '{sid}'." in kill_res.stdout
 
     ps_res = _run_cli("ps", env=runtime_env)
     assert ps_res.returncode == 0
@@ -269,6 +275,7 @@ def test_kill_idle_session(runtime_env: dict[str, str]) -> None:
 
     kill_res = _run_cli("kill", sid, env=runtime_env)
     assert kill_res.returncode == 0
+    assert f"Killed session '{sid}'." in kill_res.stdout
     assert kill_res.stderr == ""
 
     ps_res = _run_cli("ps", env=runtime_env)
