@@ -17,7 +17,35 @@ $ pysess ps
 yd98  pid=11733  state=idle  idle=0s  vars=3
 
 $ pysess kill yd98
-Killed session 'yd98'.
+[session: yd98 | killed]
+```
+
+### Blocking step with `curl`
+
+```console
+$ pysess new -t 0.2 <<'EOF'
+import socket
+srv = socket.create_server(("127.0.0.1", 0))
+print(f"listening on http://127.0.0.1:{srv.getsockname()[1]}", flush=True)
+conn, addr = srv.accept()
+req = conn.recv(4096).decode()
+conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+conn.close()
+print("handled request from", addr, flush=True)
+EOF
+[session: 0zvo]
+listening on http://127.0.0.1:55214
+[session: 0zvo | running (0.2s) at <repl>:4 in accept() - use 'pysess wait 0zvo' or 'pysess cancel 0zvo']
+
+$ curl -s http://127.0.0.1:55214/hello
+ok
+
+$ pysess exec 0zvo -c "req.splitlines()[0]"
+handled request from ('127.0.0.1', 55216)
+'GET /hello HTTP/1.1'
+
+$ pysess kill 0zvo
+[session: 0zvo | killed]
 ```
 
 ## Installation

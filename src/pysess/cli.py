@@ -603,6 +603,50 @@ def _format_idle_duration(seconds: float) -> str:
     return f"{days}d{hours}h" if hours else f"{days}d"
 
 
+def _format_session_status(
+    session_id: str,
+    state: str,
+    *,
+    elapsed: float | None = None,
+    location: str | None = None,
+    hint: bool = False,
+) -> str:
+    parts = [f"[session: {session_id} | {state}"]
+    if elapsed is not None:
+        parts.append(f" ({elapsed:.1f}s)")
+    if location:
+        parts.append(f" at {location}")
+    if hint:
+        parts.append(f" - use 'pysess wait {session_id}' or 'pysess cancel {session_id}'")
+    parts.append("]")
+    return "".join(parts)
+
+
+def _format_ps_rows(rows: list[dict[str, Any]]) -> list[str]:
+    table = [
+        [
+            resp["id"],
+            f"pid={resp['pid']}",
+            f"state={resp['state']}",
+            f"idle={_format_idle_duration(resp['idle_seconds'])}",
+            f"vars={len(resp.get('vars', {}))}",
+        ]
+        for resp in rows
+    ]
+    widths = [max(len(row[i]) for row in table) for i in range(len(table[0]))]
+    lines: list[str] = []
+    for resp, cols in zip(rows, table, strict=True):
+        line = "  ".join(
+            col if i == len(cols) - 1 else f"{col:<{widths[i]}}" for i, col in enumerate(cols)
+        )
+        if resp["state"] == "running":
+            elapsed = resp.get("elapsed", 0.0)
+            loc = f" at {resp['location']}" if resp.get("location") else ""
+            line = f"{line}  ({elapsed:.1f}s){loc}"
+        lines.append(line)
+    return lines
+
+
 def _emit_step_output(session_id: str, resp: dict[str, Any]) -> int:
     if stdout_delta := resp.get("stdout_delta"):
         sys.stdout.write(stdout_delta)
@@ -612,18 +656,26 @@ def _emit_step_output(session_id: str, resp: dict[str, Any]) -> int:
         sys.stderr.flush()
 
     status = resp.get("status")
-    loc = f" at {resp['location']}" if resp.get("location") else ""
     if status == "running":
-        elapsed = resp.get("elapsed", 0.0)
         print(
-            f"[session: {session_id} | RUNNING ({elapsed:.1f}s){loc} - "
-            f"use 'pysess wait {session_id}' or 'pysess cancel {session_id}']"
+            _format_session_status(
+                session_id,
+                "running",
+                elapsed=resp.get("elapsed", 0.0),
+                location=resp.get("location"),
+                hint=True,
+            )
         )
         return 0
     if status == "busy":
         print(
-            f"pysess: session '{session_id}' is busy{loc} - "
-            f"use 'pysess wait {session_id}' or 'pysess cancel {session_id}'",
+            _format_session_status(
+                session_id,
+                "busy",
+                elapsed=resp.get("elapsed", 0.0),
+                location=resp.get("location"),
+                hint=True,
+            ),
             file=sys.stderr,
         )
         return 1
@@ -774,7 +826,7 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "cancel":
             resp = _send_request(args.session_id, {"op": "cancel"})
             if resp.get("status") == "idle":
-                print(f"Session '{args.session_id}' is idle.")
+                print(_format_session_status(args.session_id, "idle"))
                 rc = 0
             else:
                 rc = _emit_step_output(args.session_id, resp)
@@ -783,34 +835,27 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "ps":
             if args.session_id:
                 resp = _send_request(args.session_id, {"op": "ps"})
-                print(
-                    f"session={resp['id']} pid={resp['pid']} state={resp['state']} "
-                    f"idle={_format_idle_duration(resp['idle_seconds'])}"
-                )
-                if resp["state"] == "running":
-                    loc = f" location={resp['location']}" if resp.get("location") else ""
-                    print(f"elapsed={resp['elapsed']}s{loc}")
+                print(_format_ps_rows([resp])[0])
                 if user_vars := resp.get("vars", {}):
                     print("vars:")
+                    width = max(len(name) for name in user_vars)
                     for name, type_name in sorted(user_vars.items()):
-                        print(f"  {name}: {type_name}")
+                        print(f"  {name:<{width}}  {type_name}")
                 else:
                     print("vars: (none)")
             else:
-                found = False
+                rows: list[dict[str, Any]] = []
                 for sock_file in sorted(runtime_dir().glob("*.sock")):
                     try:
-                        resp = _send_request(sock_file.stem, {"op": "ps"})
+                        rows.append(_send_request(sock_file.stem, {"op": "ps"}))
                     except RuntimeError:
                         with contextlib.suppress(OSError):
                             sock_file.unlink()
                         continue
-                    found = True
-                    print(
-                        f"{resp['id']}\tpid={resp['pid']}\tstate={resp['state']}\t"
-                        f"idle={_format_idle_duration(resp['idle_seconds'])}\tvars={len(resp.get('vars', {}))}"
-                    )
-                if not found:
+                if rows:
+                    for line in _format_ps_rows(rows):
+                        print(line)
+                else:
                     print("No active sessions.")
             rc = 0
         else:  # kill
@@ -824,12 +869,12 @@ def main(argv: list[str] | None = None) -> None:
                             sock_file.unlink()
                         continue
                     killed_any = True
-                    print(f"Killed session '{sock_file.stem}'.")
+                    print(_format_session_status(sock_file.stem, "killed"))
                 if not killed_any:
                     print("No active sessions.")
             else:
                 _send_request(args.session_id, {"op": "kill"})
-                print(f"Killed session '{args.session_id}'.")
+                print(_format_session_status(args.session_id, "killed"))
             rc = 0
     except (OSError, RuntimeError) as exc:
         print(f"pysess: {exc}", file=sys.stderr)

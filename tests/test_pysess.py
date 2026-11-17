@@ -120,12 +120,12 @@ def test_slow_call_detach_location_incremental_wait_and_busy_guard(
         res = _run_cli("exec", sid, "-t", "0.15", "-c", code, env=runtime_env)
         assert res.returncode == 0
         assert "step1" in res.stdout
-        assert f"[session: {sid} | RUNNING" in res.stdout
+        assert f"[session: {sid} | running" in res.stdout
         assert "<repl>:2" in res.stdout
 
         busy = _run_cli("exec", sid, "-c", "1 + 1", env=runtime_env)
         assert busy.returncode == 1
-        assert "busy" in busy.stderr
+        assert f"[session: {sid} | busy" in busy.stderr
 
         poll = _run_cli("wait", sid, "-t", "0", env=runtime_env)
         assert poll.returncode == 0
@@ -157,7 +157,7 @@ def test_blocking_server_accept_and_auto_flush_on_next_exec(
     sid = _extract_session_id(res.stdout)
 
     try:
-        assert "RUNNING" in res.stdout
+        assert f"[session: {sid} | running" in res.stdout
         assert "in accept()" in res.stdout
         port_match = re.search(r"PORT=(\d+)", res.stdout)
         assert port_match is not None
@@ -185,7 +185,7 @@ def test_cancel_interrupts_blocking_call(runtime_env: dict[str, str]) -> None:
     try:
         res = _run_cli("exec", sid, "-t", "0.1", "-c", "time.sleep(30)", env=runtime_env)
         assert res.returncode == 0
-        assert "RUNNING" in res.stdout
+        assert f"[session: {sid} | running" in res.stdout
 
         cancel_res = _run_cli("cancel", sid, env=runtime_env)
         assert cancel_res.returncode == 1
@@ -211,11 +211,11 @@ def test_ps_and_kill_all(runtime_env: dict[str, str]) -> None:
 
         ps_one = _run_cli("ps", sid, env=runtime_env)
         assert ps_one.returncode == 0
-        assert "alpha: list" in ps_one.stdout
+        assert "alpha  list" in ps_one.stdout
     finally:
         kill_res = _run_cli("kill", "--all", env=runtime_env)
         assert kill_res.returncode == 0
-        assert f"Killed session '{sid}'." in kill_res.stdout
+        assert f"[session: {sid} | killed]" in kill_res.stdout
 
     kill_empty = _run_cli("kill", "--all", env=runtime_env)
     assert kill_empty.returncode == 0
@@ -257,11 +257,11 @@ def test_kill_while_job_is_running(runtime_env: dict[str, str]) -> None:
 
     res = _run_cli("exec", sid, "-t", "0.1", "-c", "time.sleep(30)", env=runtime_env)
     assert res.returncode == 0
-    assert "RUNNING" in res.stdout
+    assert f"[session: {sid} | running" in res.stdout
 
     kill_res = _run_cli("kill", sid, env=runtime_env)
     assert kill_res.returncode == 0
-    assert f"Killed session '{sid}'." in kill_res.stdout
+    assert f"[session: {sid} | killed]" in kill_res.stdout
 
     ps_res = _run_cli("ps", env=runtime_env)
     assert ps_res.returncode == 0
@@ -275,7 +275,7 @@ def test_kill_idle_session(runtime_env: dict[str, str]) -> None:
 
     kill_res = _run_cli("kill", sid, env=runtime_env)
     assert kill_res.returncode == 0
-    assert f"Killed session '{sid}'." in kill_res.stdout
+    assert f"[session: {sid} | killed]" in kill_res.stdout
     assert kill_res.stderr == ""
 
     ps_res = _run_cli("ps", env=runtime_env)

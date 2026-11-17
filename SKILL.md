@@ -20,7 +20,7 @@ EOF
 # Output:
 # [session: k9x2]
 # listening on http://127.0.0.1:54321
-# [session: k9x2 | RUNNING (0.2s) at <repl>:4 in accept() - use 'pysess wait k9x2' or 'pysess cancel k9x2']
+# [session: k9x2 | running (0.2s) at <repl>:4 in accept() - use 'pysess wait k9x2' or 'pysess cancel k9x2']
 
 # 2. Trigger the waiting server from another command
 curl -s http://127.0.0.1:54321/hello
@@ -36,7 +36,7 @@ pysess kill k9x2
 ## Rules
 - Keep persistent resources (clients, connections, sockets, open files) in top-level variables instead of closing them in `with` blocks at the end of an `exec` step.
 - `-t SEC` accepts floats (default `10s`); pass a short timeout when intentionally starting a blocking or long-running step.
-- If a step runs past `-t SEC`, `pysess` detaches it and prints `RUNNING (<elapsed>s) at <repl>:line in func()`:
+- If a step runs past `-t SEC`, `pysess` detaches it and prints `[session: <id> | running (<elapsed>s) at <repl>:line in func() - ...]`:
   - Once it finishes, the next `pysess exec <id>` automatically flushes its unread output before running new code.
   - While it is still running, use `pysess wait <id>` (or `-t 0` to poll) to wait, or `pysess cancel <id>` to interrupt with `KeyboardInterrupt`.
 - Run `pysess ps [<id>]` to inspect active sessions, blocked locations, and defined variables.
