@@ -8,6 +8,15 @@ Persistent Python REPL sessions for coding agents.
 
 ![pysess demo](assets/demo.svg)
 
+| Command | Description |
+| --- | --- |
+| `pysess new [-n NAME] [-t SEC \| -d] [-c CODE \| FILE]` | Start a new session (random ID or `-n`/`--name`) and optionally run code from `-c`, `FILE`, or `stdin`. |
+| `pysess exec ID [-t SEC \| -d] [-c CODE \| FILE]` | Run code in `ID` (reads `stdin` by default). Waits up to `-t`/`--timeout` (default `10`s), or use `-d`/`--detach` to run in the background. |
+| `pysess wait ID [-t SEC]` | Wait for a background step in `ID` up to `-t`/`--timeout` (default `30`s; `-t 0` to poll). |
+| `pysess cancel ID` | Interrupt the running step in `ID` with `KeyboardInterrupt` while keeping session state alive. |
+| `pysess ps [ID]` | List active sessions, or inspect `ID` for state, running location, idle time, and variables. |
+| `pysess kill [ID \| --all]` | Stop session `ID` (or all sessions with `--all`) and remove socket files. |
+
 ## Installation
 
 Install `pysess` globally with [`uv`](https://docs.astral.sh/uv/):
