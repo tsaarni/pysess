@@ -34,7 +34,7 @@ DEFAULT_IDLE_TIMEOUT = 3600.0
 MAX_EXPR_REPR_BYTES = 32 * 1024
 SESSION_ID_ALPHABET = string.ascii_lowercase + string.digits
 SESSION_ID_LENGTH = 4
-_SESSION_ID_RE = re.compile(r"^[a-z0-9]{1,32}$")
+_SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$")
 
 
 def runtime_dir() -> Path:
@@ -737,6 +737,12 @@ def build_parser() -> argparse.ArgumentParser:
         "new",
         help="Start a new session, optionally run code, and print session ID.",
     )
+    new_parser.add_argument(
+        "-n",
+        "--name",
+        metavar="NAME",
+        help="Optional custom session name (default: random ID).",
+    )
     _add_code_source_args(new_parser)
     _add_exec_wait_args(new_parser)
 
@@ -804,7 +810,19 @@ def main(argv: list[str] | None = None) -> None:
         if args.command == "new":
             code = _read_code(args.code, args.file, read_stdin_tty_safe=True)
             timeout = 0.0 if args.detach else args.timeout
-            sid = generate_session_id()
+            if args.name is not None:
+                sid = args.name
+                sock_path = socket_path(sid)
+                if sock_path.exists():
+                    try:
+                        _send_request(sid, {"op": "ps"})
+                    except RuntimeError:
+                        with contextlib.suppress(OSError):
+                            sock_path.unlink()
+                    else:
+                        raise RuntimeError(f"Session '{sid}' already exists.")
+            else:
+                sid = generate_session_id()
             _spawn_daemon(sid)
             print(f"[pysess: {sid}]", flush=True)
             rc = (

@@ -6,34 +6,7 @@ Persistent Python REPL sessions for coding agents.
 
 ## Usage
 
-```console
-$ pysess new <<'EOF'
-import socket
-srv = socket.create_server(("127.0.0.1", 0))
-f"http://127.0.0.1:{srv.getsockname()[1]}"
-EOF
-[pysess: 0zvo]
-'http://127.0.0.1:55214'
-
-$ pysess exec 0zvo -d <<'EOF'
-conn, addr = srv.accept()
-req = conn.recv(4096).decode()
-conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-conn.close()
-print("handled request from", addr, flush=True)
-EOF
-[pysess: 0zvo | running (0.0s) at <repl>:1 in accept() - use 'pysess wait 0zvo' or 'pysess cancel 0zvo']
-
-$ curl -s http://127.0.0.1:55214/hello
-ok
-
-$ pysess exec 0zvo -c "req.splitlines()[0]"
-handled request from ('127.0.0.1', 55216)
-'GET /hello HTTP/1.1'
-
-$ pysess kill 0zvo
-[pysess: 0zvo | killed]
-```
+![pysess demo](assets/demo.svg)
 
 ## Installation
 

@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 548" width="820" height="548" role="img" aria-label="pysess terminal demo">
+  <style>
+    .bg { fill: #0d1117; }
+    .bar { fill: #161b22; }
+    .bd { fill: none; stroke: #30363d; }
+    text { font: 13px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; fill: #c9d1d9; white-space: pre; }
+    .ti { font-size: 12px; fill: #8b949e; }
+    .p { fill: #3fb950; font-weight: 600; }
+    .c { fill: #e6edf3; font-weight: 600; }
+    .b { fill: #79c0ff; }
+    .k { fill: #ff7b72; }
+    .s { fill: #a5d6ff; }
+    .w { fill: #d29922; }
+    .o { fill: #8b949e; }
+    .loop { animation: fade 21s infinite; }
+    @keyframes fade { 0%, 97.5% { opacity: 1; } 99%, 100% { opacity: 0; } }
+    .r1 { animation: s1 21s infinite; }
+    @keyframes s1 { 0%, 1.4% { transform: translateX(0); animation-timing-function: steps(35, end); } 6.7%, 98.9% { transform: translateX(307px); } 100% { transform: translateX(0); } }
+    .r2 { animation: s2 21s infinite; }
+    @keyframes s2 { 0%, 21.4% { transform: translateX(0); animation-timing-function: steps(36, end); } 27.1%, 98.9% { transform: translateX(315px); } 100% { transform: translateX(0); } }
+    .r3 { animation: s3 21s infinite; }
+    @keyframes s3 { 0%, 42.9% { transform: translateX(0); animation-timing-function: steps(38, end); } 48.1%, 98.9% { transform: translateX(331px); } 100% { transform: translateX(0); } }
+    .r4 { animation: s4 21s infinite; }
+    @keyframes s4 { 0%, 59.5% { transform: translateX(0); animation-timing-function: steps(50, end); } 65.7%, 98.9% { transform: translateX(429px); } 100% { transform: translateX(0); } }
+    .r5 { animation: s5 21s infinite; }
+    @keyframes s5 { 0%, 78.6% { transform: translateX(0); animation-timing-function: steps(25, end); } 82.4%, 98.9% { transform: translateX(224px); } 100% { transform: translateX(0); } }
+    .h1 { opacity: 0; animation: h1 21s infinite; }
+    @keyframes h1 { 0%, 6.9% { opacity: 0; } 7.1%, 100% { opacity: 1; } }
+    .o1 { opacity: 0; animation: o1 21s infinite; }
+    @keyframes o1 { 0%, 7.6% { opacity: 0; } 7.9%, 100% { opacity: 1; } }
+    .h2 { opacity: 0; animation: h2 21s infinite; }
+    @keyframes h2 { 0%, 27.4% { opacity: 0; } 27.6%, 100% { opacity: 1; } }
+    .o2 { opacity: 0; animation: o2 21s infinite; }
+    @keyframes o2 { 0%, 28.1% { opacity: 0; } 28.3%, 100% { opacity: 1; } }
+    .o3 { opacity: 0; animation: o3 21s infinite; }
+    @keyframes o3 { 0%, 48.8% { opacity: 0; } 49.0%, 100% { opacity: 1; } }
+    .o4 { opacity: 0; animation: o4 21s infinite; }
+    @keyframes o4 { 0%, 66.2% { opacity: 0; } 66.4%, 100% { opacity: 1; } }
+    .o5 { opacity: 0; animation: o5 21s infinite; }
+    @keyframes o5 { 0%, 82.9% { opacity: 0; } 83.1%, 100% { opacity: 1; } }
+  </style>
+
+  <rect class="bg" x=".5" y=".5" width="819" height="547" rx="10" />
+  <path class="bar" d="M10.5.5h799a10 10 0 0 1 10 10V36H.5V10.5a10 10 0 0 1 10-10Z" />
+  <rect class="bd" x=".5" y=".5" width="819" height="547" rx="10" />
+
+  <circle cx="20" cy="18" r="6" fill="#ff5f56" />
+  <circle cx="40" cy="18" r="6" fill="#ffbd2e" />
+  <circle cx="60" cy="18" r="6" fill="#27c93f" />
+  <text class="ti" x="410" y="22" text-anchor="middle">pysess</text>
+
+  <g class="loop" transform="translate(20,0)">
+    <text y="66"><tspan class="p">$</tspan> <tspan class="c">pysess new</tspan> <tspan class="b">-n</tspan> http-server <tspan class="b">&lt;&lt;'EOF'</tspan></text>
+    <rect class="bg r1" y="50" width="307" height="22" />
+    <text y="214"><tspan class="p">$</tspan> <tspan class="c">pysess exec</tspan> http-server <tspan class="b">-d &lt;&lt;'EOF'</tspan></text>
+    <rect class="bg r2" y="198" width="315" height="22" />
+    <text y="382"><tspan class="p">$</tspan> <tspan class="c">curl -s http://127.0.0.1:55214/hello</tspan></text>
+    <rect class="bg r3" y="366" width="331" height="22" />
+    <text y="430"><tspan class="p">$</tspan> <tspan class="c">pysess exec</tspan> http-server <tspan class="b">-c</tspan> <tspan class="s">"req.splitlines()[0]"</tspan></text>
+    <rect class="bg r4" y="414" width="429" height="22" />
+    <text y="498"><tspan class="p">$</tspan> <tspan class="c">pysess kill</tspan> http-server</text>
+    <rect class="bg r5" y="482" width="224" height="22" />
+    <g class="h1">
+      <text y="86"><tspan class="k">import</tspan> socket</text>
+      <text y="106">srv = socket.create_server((<tspan class="s">"127.0.0.1"</tspan>, 0))</text>
+      <text y="126"><tspan class="s">f"http://127.0.0.1:{srv.getsockname()[1]}"</tspan></text>
+      <text y="146" class="b">EOF</text>
+    </g>
+    <g class="o1">
+      <text y="166" class="w">[pysess: http-server]</text>
+      <text y="186" class="o">'http://127.0.0.1:55214'</text>
+    </g>
+    <g class="h2">
+      <text y="234">conn, addr = srv.accept()</text>
+      <text y="254">req = conn.recv(4096).decode()</text>
+      <text y="274">conn.sendall(<tspan class="s">b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"</tspan>)</text>
+      <text y="294">conn.close()</text>
+      <text y="314">print(<tspan class="s">"handled request from"</tspan>, addr, flush=<tspan class="k">True</tspan>)</text>
+      <text y="334" class="b">EOF</text>
+    </g>
+    <g class="o2">
+      <text y="354" class="w">[pysess: http-server | running (0.0s) - use 'pysess wait http-server' or 'pysess cancel http-server']</text>
+    </g>
+    <g class="o3">
+      <text y="402" class="o">ok</text>
+    </g>
+    <g class="o4">
+      <text y="450" class="o">handled request from ('127.0.0.1', 55216)</text>
+      <text y="470" class="o">'GET /hello HTTP/1.1'</text>
+    </g>
+    <g class="o5">
+      <text y="518" class="w">[pysess: http-server | killed]</text>
+    </g>
+  </g>
+</svg>

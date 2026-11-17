@@ -427,3 +427,25 @@ def test_detach_flag_on_new_and_exec(runtime_env: dict[str, str]) -> None:
         assert "exec_done" in wait_res2.stdout
     finally:
         _run_cli("kill", sid, env=runtime_env)
+
+
+def test_named_session_and_collision_guard(runtime_env: dict[str, str]) -> None:
+    res = _run_cli("new", "-n", "http-srv", "-c", "port = 8080", env=runtime_env)
+    assert res.returncode == 0, res.stderr
+    assert "[pysess: http-srv]" in res.stdout
+
+    try:
+        dup = _run_cli("new", "--name", "http-srv", env=runtime_env)
+        assert dup.returncode == 1
+        assert "already exists" in dup.stderr
+
+        exec_res = _run_cli("exec", "http-srv", "-c", "port", env=runtime_env)
+        assert exec_res.returncode == 0, exec_res.stderr
+        assert exec_res.stdout.strip() == "8080"
+    finally:
+        kill_res = _run_cli("kill", "http-srv", env=runtime_env)
+        assert kill_res.returncode == 0
+
+    bad = _run_cli("new", "-n", "../bad", env=runtime_env)
+    assert bad.returncode == 1
+    assert "Invalid session ID" in bad.stderr
