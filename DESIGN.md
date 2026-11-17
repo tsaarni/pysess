@@ -15,7 +15,7 @@ When a coding agent runs Python through a stateless `bash` tool (`python3 -c "..
 ## 1. Core Design Decisions & Findings
 
 ### 1.1 Ephemeral Session IDs (`new` $\rightarrow$ `<id>`, `exec <id>`)
-- `pysess new` spawns a background interpreter daemon, allocates a short random session ID (such as `k9x2`), optionally runs initial code in the same turn, and prints `[session: k9x2]`.
+- `pysess new` spawns a background interpreter daemon, allocates a short random session ID (such as `k9x2`), optionally runs initial code in the same turn, and prints `[pysess: k9x2]`.
 - Subsequent commands pass `<id>` positionally (`pysess exec k9x2 ...`).
 - **Parallel sessions = separate OS processes:** Every `pysess new` launches an independent `sys.executable` process with its own GIL, memory space, and Unix domain socket (`<id>.sock`). Multiple agents or subagents can run sessions in parallel without colliding.
 - **Context-reset immunity:** If the LLM context window is compacted or cleared, the agent does not know stale session IDs and naturally starts a clean session with `pysess new`.
@@ -32,7 +32,7 @@ We evaluated three models for handling slow or blocking calls:
    - Steps wait up to `-t SEC` (accepts fractional seconds such as `-t 0.2`; default `10s`). Agents can pass `-t 0.2` when intentionally starting a blocking wait like `srv.accept()`.
    - If the step is still running when `-t` expires, the daemon **keeps the step running on the Main Thread** and detaches the CLI client, reporting the exact `<repl>` line and function where the main thread is currently parked via `sys._current_frames()`:
      ```text
-     [session: k9x2 | RUNNING (0.2s) at <repl>:4 in accept() - use 'pysess wait k9x2' or 'pysess cancel k9x2']
+     [pysess: k9x2 | RUNNING (0.2s) at <repl>:4 in accept() - use 'pysess wait k9x2' or 'pysess cancel k9x2']
      ```
 
 ### 1.3 Why User Code Must Run Sequentially on the Main Thread (CPython PEP 475)
@@ -73,7 +73,7 @@ sequenceDiagram
     CLI->>Daemon: Spawn detached process & send {op: "exec", timeout: 1.0}
     Note over Daemon: Main thread binds srv, prints port, blocks in srv.accept()
     Daemon-->>CLI: {status: "running", location: "<repl>:4 in accept()", stdout_delta: "listening on ..."}
-    CLI-->>Agent: [session: k9x2] + stdout + RUNNING at <repl>:4 in accept()
+    CLI-->>Agent: [pysess: k9x2] + stdout + RUNNING at <repl>:4 in accept()
 
     Agent->>Daemon: curl http://127.0.0.1:54321/hello (external bash call)
     Note over Daemon: Main thread wakes up from srv.accept(), reads request, replies 200 OK, finishes job
@@ -100,9 +100,9 @@ conn.close()
 print("handled request from", addr, flush=True)
 EOF
 # Output:
-# [session: k9x2]
+# [pysess: k9x2]
 # listening on http://127.0.0.1:54321
-# [session: k9x2 | RUNNING (0.2s) at <repl>:4 in accept() - use 'pysess wait k9x2' or 'pysess cancel k9x2']
+# [pysess: k9x2 | RUNNING (0.2s) at <repl>:4 in accept() - use 'pysess wait k9x2' or 'pysess cancel k9x2']
 
 # Turn 2: Send an HTTP request to the waiting server from bash
 curl -s http://127.0.0.1:54321/hello

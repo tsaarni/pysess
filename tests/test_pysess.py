@@ -41,7 +41,7 @@ def _run_cli(
 
 
 def _extract_session_id(output: str) -> str:
-    match = re.search(r"\[session:\s*([a-z0-9]+)\]", output)
+    match = re.search(r"\[pysess:\s*([a-z0-9]+)\]", output)
     assert match is not None, f"Could not find session ID in: {output!r}"
     return match.group(1)
 
@@ -49,9 +49,22 @@ def _extract_session_id(output: str) -> str:
 def test_cli_default_timeouts() -> None:
     parser = build_parser()
     assert parser.parse_args(["new"]).timeout == 10.0
+    assert parser.parse_args(["new"]).detach is False
+    assert parser.parse_args(["new", "-d"]).detach is True
+    assert parser.parse_args(["new", "--detach"]).detach is True
+    assert parser.parse_args(["new", "--timeout", "2.5"]).timeout == 2.5
     assert parser.parse_args(["exec", "k9x2"]).timeout == 10.0
+    assert parser.parse_args(["exec", "k9x2", "-d"]).detach is True
+    assert parser.parse_args(["exec", "k9x2", "--detach"]).detach is True
+    assert parser.parse_args(["exec", "k9x2", "--timeout", "1.5"]).timeout == 1.5
     assert parser.parse_args(["wait", "k9x2"]).timeout == 30.0
     assert parser.parse_args(["wait", "k9x2", "-t", "0"]).timeout == 0.0
+    assert parser.parse_args(["wait", "k9x2", "--timeout", "0"]).timeout == 0.0
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["new", "-d", "-t", "1"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["exec", "k9x2", "--detach", "--timeout", "1"])
 
 
 def test_persistent_state_and_jupyter_eval(runtime_env: dict[str, str]) -> None:
@@ -120,12 +133,12 @@ def test_slow_call_detach_location_incremental_wait_and_busy_guard(
         res = _run_cli("exec", sid, "-t", "0.15", "-c", code, env=runtime_env)
         assert res.returncode == 0
         assert "step1" in res.stdout
-        assert f"[session: {sid} | running" in res.stdout
+        assert f"[pysess: {sid} | running" in res.stdout
         assert "<repl>:2" in res.stdout
 
         busy = _run_cli("exec", sid, "-c", "1 + 1", env=runtime_env)
         assert busy.returncode == 1
-        assert f"[session: {sid} | busy" in busy.stderr
+        assert f"[pysess: {sid} | busy" in busy.stderr
 
         poll = _run_cli("wait", sid, "-t", "0", env=runtime_env)
         assert poll.returncode == 0
@@ -157,7 +170,7 @@ def test_blocking_server_accept_and_auto_flush_on_next_exec(
     sid = _extract_session_id(res.stdout)
 
     try:
-        assert f"[session: {sid} | running" in res.stdout
+        assert f"[pysess: {sid} | running" in res.stdout
         assert "in accept()" in res.stdout
         port_match = re.search(r"PORT=(\d+)", res.stdout)
         assert port_match is not None
@@ -185,7 +198,7 @@ def test_cancel_interrupts_blocking_call(runtime_env: dict[str, str]) -> None:
     try:
         res = _run_cli("exec", sid, "-t", "0.1", "-c", "time.sleep(30)", env=runtime_env)
         assert res.returncode == 0
-        assert f"[session: {sid} | running" in res.stdout
+        assert f"[pysess: {sid} | running" in res.stdout
 
         cancel_res = _run_cli("cancel", sid, env=runtime_env)
         assert cancel_res.returncode == 1
@@ -215,7 +228,7 @@ def test_ps_and_kill_all(runtime_env: dict[str, str]) -> None:
     finally:
         kill_res = _run_cli("kill", "--all", env=runtime_env)
         assert kill_res.returncode == 0
-        assert f"[session: {sid} | killed]" in kill_res.stdout
+        assert f"[pysess: {sid} | killed]" in kill_res.stdout
 
     kill_empty = _run_cli("kill", "--all", env=runtime_env)
     assert kill_empty.returncode == 0
@@ -257,11 +270,11 @@ def test_kill_while_job_is_running(runtime_env: dict[str, str]) -> None:
 
     res = _run_cli("exec", sid, "-t", "0.1", "-c", "time.sleep(30)", env=runtime_env)
     assert res.returncode == 0
-    assert f"[session: {sid} | running" in res.stdout
+    assert f"[pysess: {sid} | running" in res.stdout
 
     kill_res = _run_cli("kill", sid, env=runtime_env)
     assert kill_res.returncode == 0
-    assert f"[session: {sid} | killed]" in kill_res.stdout
+    assert f"[pysess: {sid} | killed]" in kill_res.stdout
 
     ps_res = _run_cli("ps", env=runtime_env)
     assert ps_res.returncode == 0
@@ -275,7 +288,7 @@ def test_kill_idle_session(runtime_env: dict[str, str]) -> None:
 
     kill_res = _run_cli("kill", sid, env=runtime_env)
     assert kill_res.returncode == 0
-    assert f"[session: {sid} | killed]" in kill_res.stdout
+    assert f"[pysess: {sid} | killed]" in kill_res.stdout
     assert kill_res.stderr == ""
 
     ps_res = _run_cli("ps", env=runtime_env)
@@ -352,7 +365,7 @@ def test_new_with_missing_file_does_not_leak_session(
     missing_file = tmp_path / "does_not_exist.py"
     res = _run_cli("new", str(missing_file), env=runtime_env)
     assert res.returncode == 1
-    assert "[session:" not in res.stdout
+    assert "[pysess:" not in res.stdout
 
     ps_res = _run_cli("ps", env=runtime_env)
     assert ps_res.returncode == 0
@@ -376,3 +389,41 @@ def test_format_idle_duration() -> None:
     assert _format_idle_duration(3660.0) == "1h1m"
     assert _format_idle_duration(86400.0) == "1d"
     assert _format_idle_duration(90000.0) == "1d1h"
+
+
+def test_detach_flag_on_new_and_exec(runtime_env: dict[str, str]) -> None:
+    start = time.monotonic()
+    res = _run_cli(
+        "new",
+        "-d",
+        "-c",
+        "import time\ntime.sleep(0.25)\nprint('new_done', flush=True)\n",
+        env=runtime_env,
+    )
+    elapsed = time.monotonic() - start
+    assert res.returncode == 0, res.stderr
+    assert elapsed < 1.5
+    sid = _extract_session_id(res.stdout)
+    assert f"[pysess: {sid} | running" in res.stdout
+
+    try:
+        wait_res = _run_cli("wait", sid, "--timeout", "5", env=runtime_env)
+        assert wait_res.returncode == 0, wait_res.stderr
+        assert "new_done" in wait_res.stdout
+
+        exec_res = _run_cli(
+            "exec",
+            sid,
+            "--detach",
+            "-c",
+            "time.sleep(0.2)\nprint('exec_done', flush=True)\n",
+            env=runtime_env,
+        )
+        assert exec_res.returncode == 0, exec_res.stderr
+        assert f"[pysess: {sid} | running" in exec_res.stdout
+
+        wait_res2 = _run_cli("wait", sid, "-t", "5", env=runtime_env)
+        assert wait_res2.returncode == 0, wait_res2.stderr
+        assert "exec_done" in wait_res2.stdout
+    finally:
+        _run_cli("kill", sid, env=runtime_env)

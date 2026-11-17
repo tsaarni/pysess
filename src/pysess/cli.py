@@ -611,7 +611,7 @@ def _format_session_status(
     location: str | None = None,
     hint: bool = False,
 ) -> str:
-    parts = [f"[session: {session_id} | {state}"]
+    parts = [f"[pysess: {session_id} | {state}"]
     if elapsed is not None:
         parts.append(f" ({elapsed:.1f}s)")
     if location:
@@ -695,6 +695,27 @@ def _add_code_source_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument("file", nargs="?", help="Path to a Python file to execute.")
 
 
+def _add_exec_wait_args(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "-t",
+        "--timeout",
+        type=float,
+        default=DEFAULT_EXEC_TIMEOUT,
+        metavar="SEC",
+        help=(
+            f"Soft timeout in seconds (supports decimals, e.g. 0.2) before detaching "
+            f"(default: {DEFAULT_EXEC_TIMEOUT:g})."
+        ),
+    )
+    group.add_argument(
+        "-d",
+        "--detach",
+        action="store_true",
+        help="Run in the background and detach immediately without waiting.",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser for `pysess`."""
     parser = argparse.ArgumentParser(
@@ -717,17 +738,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Start a new session, optionally run code, and print session ID.",
     )
     _add_code_source_args(new_parser)
-    new_parser.add_argument(
-        "-t",
-        "--timeout",
-        type=float,
-        default=DEFAULT_EXEC_TIMEOUT,
-        metavar="SEC",
-        help=(
-            f"Soft timeout in seconds (supports decimals, e.g. 0.2) before detaching "
-            f"(default: {DEFAULT_EXEC_TIMEOUT:g})."
-        ),
-    )
+    _add_exec_wait_args(new_parser)
 
     exec_parser = subparsers.add_parser(
         "exec",
@@ -735,17 +746,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     exec_parser.add_argument("session_id", metavar="ID", help="Target session ID.")
     _add_code_source_args(exec_parser)
-    exec_parser.add_argument(
-        "-t",
-        "--timeout",
-        type=float,
-        default=DEFAULT_EXEC_TIMEOUT,
-        metavar="SEC",
-        help=(
-            f"Soft timeout in seconds (supports decimals, e.g. 0.2) before detaching "
-            f"(default: {DEFAULT_EXEC_TIMEOUT:g})."
-        ),
-    )
+    _add_exec_wait_args(exec_parser)
 
     wait_parser = subparsers.add_parser(
         "wait",
@@ -802,22 +803,24 @@ def main(argv: list[str] | None = None) -> None:
     try:
         if args.command == "new":
             code = _read_code(args.code, args.file, read_stdin_tty_safe=True)
+            timeout = 0.0 if args.detach else args.timeout
             sid = generate_session_id()
             _spawn_daemon(sid)
-            print(f"[session: {sid}]", flush=True)
+            print(f"[pysess: {sid}]", flush=True)
             rc = (
                 _emit_step_output(
                     sid,
-                    _send_request(sid, {"op": "exec", "code": code, "timeout": args.timeout}),
+                    _send_request(sid, {"op": "exec", "code": code, "timeout": timeout}),
                 )
                 if code.strip()
                 else 0
             )
         elif args.command == "exec":
             code = _read_code(args.code, args.file, read_stdin_tty_safe=False)
+            timeout = 0.0 if args.detach else args.timeout
             resp = _send_request(
                 args.session_id,
-                {"op": "exec", "code": code, "timeout": args.timeout},
+                {"op": "exec", "code": code, "timeout": timeout},
             )
             rc = _emit_step_output(args.session_id, resp)
         elif args.command == "wait":
