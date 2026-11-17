@@ -648,6 +648,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pysess",
         description="Persistent Python REPL sessions for coding agents.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            '  pysess new -c "x = 40"         # start a session and run code\n'
+            '  pysess exec <id> -c "x + 2"    # run in the same session (prints 42)\n'
+            "  pysess exec <id> <<'EOF'       # run multiline code from stdin\n"
+            "  pysess ps                      # list active sessions\n"
+            "  pysess kill <id>               # stop session (or --all)"
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -733,7 +742,11 @@ def main(argv: list[str] | None = None) -> None:
         daemon = SessionDaemon(effective_argv[1], Path(effective_argv[2]))
         raise SystemExit(daemon.run())
 
-    args = build_parser().parse_args(effective_argv)
+    parser = build_parser()
+    if not effective_argv:
+        parser.print_help()
+        return
+    args = parser.parse_args(effective_argv)
     try:
         if args.command == "new":
             code = _read_code(args.code, args.file, read_stdin_tty_safe=True)

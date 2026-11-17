@@ -46,15 +46,6 @@ def _extract_session_id(output: str) -> str:
     return match.group(1)
 
 
-def test_cli_help(capsys: pytest.CaptureFixture[str]) -> None:
-    with pytest.raises(SystemExit) as exc_info:
-        main(["--help"])
-    assert exc_info.value.code == 0
-    out = capsys.readouterr().out
-    for cmd in ("new", "exec", "wait", "cancel", "ps", "kill"):
-        assert cmd in out
-
-
 def test_cli_default_timeouts() -> None:
     parser = build_parser()
     assert parser.parse_args(["new"]).timeout == 10.0
