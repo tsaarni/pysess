@@ -24,7 +24,9 @@ import threading
 import time
 import traceback
 import types
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -87,15 +89,63 @@ def generate_session_id() -> str:
     raise RuntimeError("Failed to allocate a unique session ID.")
 
 
+def _format_repl_cell(code: str) -> str:
+    """Format a code cell with Python REPL `>>> ` and `... ` prompts."""
+    lines = code.rstrip("\r\n").splitlines() or [""]
+    return (
+        "\n".join(
+            f"{'>>>' if i == 0 else '...'} {line}" if line or i == 0 else "..."
+            for i, line in enumerate(lines)
+        )
+        + "\n"
+    )
+
+
+class _SessionLog:
+    """Thread-safe append-only REPL transcript writer for a session."""
+
+    def __init__(self, log_path: Path) -> None:
+        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        self._file = os.fdopen(fd, "w", encoding="utf-8")
+        self._lock = threading.Lock()
+        self._at_bol = True
+
+    def write(self, text: str, *, ensure_bol: bool = False) -> None:
+        if not text:
+            return
+        with self._lock:
+            if self._file.closed:
+                return
+            if ensure_bol and not self._at_bol:
+                self._file.write("\n")
+            self._file.write(text)
+            self._file.flush()
+            self._at_bol = text.endswith("\n")
+
+    def close(self) -> None:
+        with self._lock, contextlib.suppress(OSError):
+            self._file.close()
+
+
+def _open_session_log(session_id: str) -> _SessionLog | None:
+    """Open a timestamped REPL log file if `PYSESS_LOG_DIR` is set."""
+    if not (raw := os.environ.get("PYSESS_LOG_DIR", "").strip()):
+        return None
+    base = Path(raw)
+    base.mkdir(parents=True, exist_ok=True)
+    return _SessionLog(base / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{session_id}.log")
+
+
 class _IncrementalBuffer(io.TextIOBase):
     """Thread-safe incremental text buffer that clears chunks as they are read."""
 
     encoding: str = "utf-8"
     errors: str | None = "replace"
 
-    def __init__(self) -> None:
+    def __init__(self, on_write: Callable[[str], None] | None = None) -> None:
         self._lock = threading.Lock()
         self._chunks: list[str] = []
+        self._on_write = on_write
 
     def isatty(self) -> bool:
         return False
@@ -103,11 +153,20 @@ class _IncrementalBuffer(io.TextIOBase):
     def writable(self) -> bool:
         return True
 
+    def seed(self, s: str) -> None:
+        """Append previously captured text without triggering `on_write`."""
+        if not s:
+            return
+        with self._lock:
+            self._chunks.append(s)
+
     def write(self, s: str) -> int:
         if not s:
             return 0
         with self._lock:
             self._chunks.append(s)
+        if self._on_write is not None:
+            self._on_write(s)
         return len(s)
 
     def flush(self) -> None:
@@ -236,6 +295,7 @@ class SessionDaemon:
         self.session_id = session_id
         self.sock_path = sock_path
         self.idle_timeout = idle_timeout_seconds()
+        self.session_log: _SessionLog | None = None
 
         main_module = types.ModuleType("__main__")
         main_module.__dict__["__builtins__"] = builtins
@@ -263,8 +323,11 @@ class SessionDaemon:
         os.chmod(self.sock_path, 0o600)
         self._server_sock.listen(16)
         self._server_sock.settimeout(0.5)
+        self.session_log = _open_session_log(session_id)
 
     def _cleanup(self) -> None:
+        if self.session_log is not None:
+            self.session_log.close()
         with contextlib.suppress(OSError):
             self._server_sock.close()
         with contextlib.suppress(OSError):
@@ -363,11 +426,16 @@ class SessionDaemon:
                     prev_stderr = self.current_job.stderr_buf.read_delta()
                     self.current_job.result_delivered = True
 
-                job = _Job(code=str(req.get("code", "")))
+                on_output = self.session_log.write if self.session_log is not None else None
+                job = _Job(
+                    code=str(req.get("code", "")),
+                    stdout_buf=_IncrementalBuffer(on_write=on_output),
+                    stderr_buf=_IncrementalBuffer(on_write=on_output),
+                )
                 if prev_stdout:
-                    job.stdout_buf.write(prev_stdout)
+                    job.stdout_buf.seed(prev_stdout)
                 if prev_stderr:
-                    job.stderr_buf.write(prev_stderr)
+                    job.stderr_buf.seed(prev_stderr)
                 self.current_job = job
                 self.work_queue.put(job)
 
@@ -486,6 +554,12 @@ class SessionDaemon:
                     break
 
                 exited_via_sys_exit = False
+                if self.session_log is not None:
+                    ts = datetime.now().astimezone().isoformat(timespec="seconds")
+                    self.session_log.write(
+                        f"# pysess {ts}\n{_format_repl_cell(job.code)}",
+                        ensure_bol=True,
+                    )
                 with (
                     contextlib.redirect_stdout(job.stdout_buf),
                     contextlib.redirect_stderr(job.stderr_buf),
@@ -496,6 +570,8 @@ class SessionDaemon:
                             raise KeyboardInterrupt
                         job.expr_repr = _execute_cell(job.code, self.namespace)
                         self._in_user_code = False
+                        if self.session_log is not None and job.expr_repr is not None:
+                            self.session_log.write(f"{job.expr_repr}\n", ensure_bol=True)
                         job.status = "ok"
                     except BaseException as exc:
                         self._in_user_code = False

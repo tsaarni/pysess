@@ -17,6 +17,36 @@ Persistent Python REPL sessions for coding agents.
 | `pysess ps [ID]` | List active sessions, or inspect `ID` for state, running location, idle time, and variables. |
 | `pysess kill [ID \| --all]` | Stop session `ID` (or all sessions with `--all`) and remove socket files. |
 
+## Session Logging
+
+Set `PYSESS_LOG_DIR` to record each session's executed cells, output, and tracebacks as a Python REPL transcript (`<YYYYMMDD-HHMMSS>-<ID>.log`). Log files are kept after `pysess kill` for auditing.
+
+```bash
+export PYSESS_LOG_DIR=/tmp/pysess-logs
+
+pysess new -n audited-session -c "x = 40
+y = 2"
+pysess exec audited-session -c "x + y"
+pysess exec audited-session -c "for i in range(2):
+    print(i)"
+```
+
+Example `/tmp/pysess-logs/20261117-202636-audited-session.log`:
+
+```python
+# pysess 2026-11-17T20:26:36+02:00
+>>> x = 40
+... y = 2
+# pysess 2026-11-17T20:26:37+02:00
+>>> x + y
+42
+# pysess 2026-11-17T20:26:38+02:00
+>>> for i in range(2):
+...     print(i)
+0
+1
+```
+
 ## Installation
 
 Install `pysess` globally with [`uv`](https://docs.astral.sh/uv/):

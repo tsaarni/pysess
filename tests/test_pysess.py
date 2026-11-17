@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from pysess.cli import _format_idle_duration, _IncrementalBuffer, build_parser
+from pysess.cli import _format_idle_duration, _format_repl_cell, _IncrementalBuffer, build_parser
 
 
 @pytest.fixture
@@ -449,3 +449,81 @@ def test_named_session_and_collision_guard(runtime_env: dict[str, str]) -> None:
     bad = _run_cli("new", "-n", "../bad", env=runtime_env)
     assert bad.returncode == 1
     assert "Invalid session ID" in bad.stderr
+
+
+def test_format_repl_cell() -> None:
+    assert _format_repl_cell("x = 1\n") == ">>> x = 1\n"
+    assert _format_repl_cell("for i in range(2):\n    print(i)\n") == (
+        ">>> for i in range(2):\n...     print(i)\n"
+    )
+    assert _format_repl_cell("a = 1\n\nb = 2") == ">>> a = 1\n...\n... b = 2\n"
+    assert _format_repl_cell("") == ">>> \n"
+
+
+def test_session_log_dir_disabled_by_default(runtime_env: dict[str, str]) -> None:
+    res = _run_cli("new", "-n", "nolog", "-c", "x = 1", env=runtime_env)
+    assert res.returncode == 0, res.stderr
+    try:
+        log_files = list(Path(runtime_env["PYSESS_RUNTIME_DIR"]).glob("*.log"))
+        assert log_files == []
+    finally:
+        _run_cli("kill", "nolog", env=runtime_env)
+
+
+def test_session_log_dir_records_repl_transcript(runtime_env: dict[str, str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="pslog-") as log_dir:
+        env = runtime_env.copy()
+        env["PYSESS_LOG_DIR"] = log_dir
+
+        res = _run_cli("new", "-n", "audit", "-c", "x = 40\ny = 2\n", env=env)
+        assert res.returncode == 0, res.stderr
+
+        try:
+            res = _run_cli("exec", "audit", "-c", "x + y", env=env)
+            assert res.returncode == 0
+
+            res = _run_cli(
+                "exec",
+                "audit",
+                "-c",
+                "for i in range(2):\n    print(i)\n",
+                env=env,
+            )
+            assert res.returncode == 0
+
+            res = _run_cli("exec", "audit", "-c", "print('no_nl', end='')", env=env)
+            assert res.returncode == 0
+
+            res = _run_cli("exec", "audit", "-c", "1 / 0", env=env)
+            assert res.returncode == 1
+        finally:
+            _run_cli("kill", "audit", env=env)
+
+        log_files = list(Path(log_dir).glob("*.log"))
+        assert len(log_files) == 1
+        log_path = log_files[0]
+        assert re.fullmatch(r"\d{8}-\d{6}-audit\.log", log_path.name)
+
+        content = log_path.read_text(encoding="utf-8")
+        ts_re = r"# pysess \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[+-]\d{2}:\d{2}|Z)"
+        expected_re = (
+            f"^{ts_re}\n"
+            r">>> x = 40\n"
+            r"\.\.\. y = 2\n"
+            f"{ts_re}\n"
+            r">>> x \+ y\n"
+            r"42\n"
+            f"{ts_re}\n"
+            r">>> for i in range\(2\):\n"
+            r"\.\.\.     print\(i\)\n"
+            r"0\n"
+            r"1\n"
+            f"{ts_re}\n"
+            r">>> print\('no_nl', end=''\)\n"
+            r"no_nl\n"
+            f"{ts_re}\n"
+            r">>> 1 / 0\n"
+            r"Traceback \(most recent call last\):"
+        )
+        assert re.search(expected_re, content) is not None, content
+        assert "ZeroDivisionError: division by zero\n" in content
