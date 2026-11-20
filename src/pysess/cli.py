@@ -11,15 +11,12 @@ import io
 import json
 import os
 import queue
-import re
 import secrets
 import signal
 import socket
-import stat
 import string
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import traceback
@@ -30,41 +27,21 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from pysess import venv
+from pysess._runtime import (
+    is_socket_alive,
+    live_sessions,
+    runtime_dir,
+    send_request,
+    socket_path,
+)
+
 DEFAULT_EXEC_TIMEOUT = 10.0
 DEFAULT_WAIT_TIMEOUT = 30.0
 DEFAULT_IDLE_TIMEOUT = 3600.0
 MAX_EXPR_REPR_BYTES = 32 * 1024
 SESSION_ID_ALPHABET = string.ascii_lowercase + string.digits
 SESSION_ID_LENGTH = 4
-_SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$")
-
-
-def runtime_dir() -> Path:
-    """Return the per-user runtime directory for session Unix sockets."""
-    if custom := os.environ.get("PYSESS_RUNTIME_DIR"):
-        base = Path(custom)
-    elif xdg := os.environ.get("XDG_RUNTIME_DIR"):
-        base = Path(xdg) / f"pysess-{os.getuid()}"
-    else:
-        base = Path(tempfile.gettempdir()) / f"pysess-{os.getuid()}"
-    base.mkdir(parents=True, exist_ok=True)
-    with contextlib.suppress(OSError):
-        base.chmod(0o700)
-    st = base.lstat()
-    if not stat.S_ISDIR(st.st_mode):
-        raise RuntimeError(f"Runtime path '{base}' is not a directory.")
-    if st.st_uid != os.getuid():
-        raise RuntimeError(f"Runtime directory '{base}' is not owned by the current user.")
-    if stat.S_IMODE(st.st_mode) & 0o077:
-        raise RuntimeError(f"Runtime directory '{base}' has insecure permissions.")
-    return base
-
-
-def socket_path(session_id: str) -> Path:
-    """Return the validated Unix domain socket path for `session_id`."""
-    if not _SESSION_ID_RE.match(session_id):
-        raise RuntimeError(f"Invalid session ID: {session_id!r}.")
-    return runtime_dir() / f"{session_id}.sock"
 
 
 def idle_timeout_seconds() -> float | None:
@@ -133,7 +110,8 @@ def _open_session_log(session_id: str) -> _SessionLog | None:
         return None
     base = Path(raw)
     base.mkdir(parents=True, exist_ok=True)
-    return _SessionLog(base / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{session_id}.log")
+    stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")  # local time
+    return _SessionLog(base / f"{stamp}-{session_id}.log")
 
 
 class _IncrementalBuffer(io.TextIOBase):
@@ -278,16 +256,6 @@ def _main_thread_location() -> str | None:
     return f"<repl>:{repl_lineno}"
 
 
-def _is_socket_alive(sock_path: Path) -> bool:
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
-            probe.settimeout(0.2)
-            probe.connect(str(sock_path))
-            return True
-    except OSError:
-        return False
-
-
 class SessionDaemon:
     """Main-thread executor + control-thread Unix socket server."""
 
@@ -311,7 +279,7 @@ class SessionDaemon:
 
         self._server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         if self.sock_path.exists():
-            if _is_socket_alive(self.sock_path):
+            if is_socket_alive(self.sock_path):
                 self._server_sock.close()
                 raise RuntimeError(f"Session '{session_id}' is already active.")
             self.sock_path.unlink()
@@ -320,10 +288,11 @@ class SessionDaemon:
         except OSError as exc:
             self._server_sock.close()
             raise RuntimeError(f"Failed to bind Unix socket '{self.sock_path}': {exc}") from exc
-        os.chmod(self.sock_path, 0o600)
+        self.sock_path.chmod(0o600)
         self._server_sock.listen(16)
         self._server_sock.settimeout(0.5)
         self.session_log = _open_session_log(session_id)
+        venv._session_started(session_id)
 
     def _cleanup(self) -> None:
         if self.session_log is not None:
@@ -363,7 +332,7 @@ class SessionDaemon:
                 req = json.loads(line)
                 resp, job_to_notify = self._dispatch(req)
                 kill_after_reply = req.get("op") == "kill" and resp.get("status") == "killed"
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - report any request failure to the client
                 resp = {"status": "error", "error": str(exc)}
             with contextlib.suppress(OSError):
                 conn.sendall((json.dumps(resp) + "\n").encode("utf-8"))
@@ -497,6 +466,7 @@ class SessionDaemon:
                             0.0 if running else round(max(0.0, time.monotonic() - self.last_activity), 1)
                         ),
                         "vars": user_vars,
+                        "venv": venv._ps_info(),
                     },
                     None,
                 )
@@ -523,6 +493,7 @@ class SessionDaemon:
     def _force_exit_watchdog(self) -> None:
         time.sleep(0.5)
         self._cleanup()
+        venv._session_ended(self.session_id)
         with contextlib.suppress(Exception):
             atexit._run_exitfuncs()
         os._exit(0)
@@ -573,7 +544,7 @@ class SessionDaemon:
                         if self.session_log is not None and job.expr_repr is not None:
                             self.session_log.write(f"{job.expr_repr}\n", ensure_bol=True)
                         job.status = "ok"
-                    except BaseException as exc:
+                    except BaseException as exc:  # noqa: BLE001 - user code may raise anything
                         self._in_user_code = False
                         if isinstance(exc, SystemExit):
                             if exc.code in (None, 0):
@@ -602,33 +573,16 @@ class SessionDaemon:
         finally:
             self.shutdown_event.set()
             self._cleanup()
+            # After `_cleanup()` so `kill` is answered without waiting for the deletion.
+            venv._session_ended(self.session_id)
         return 0
-
-
-def _send_request(session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    sock_path = socket_path(session_id)
-    if not sock_path.exists():
-        raise RuntimeError(f"Session '{session_id}' not found.")
-    req_timeout = max(0.0, float(payload.get("timeout", 0.0)))
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(req_timeout + 5.0)
-            sock.connect(str(sock_path))
-            sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
-            with sock.makefile("r", encoding="utf-8") as reader:
-                line = reader.readline()
-    except OSError as exc:
-        raise RuntimeError(f"Session '{session_id}' is unreachable ({exc}).") from exc
-
-    if not line:
-        raise RuntimeError(f"Session '{session_id}' closed connection without a response.")
-    return json.loads(line)
 
 
 def _spawn_daemon(session_id: str) -> None:
     sock_path = socket_path(session_id)
     cmd = [sys.executable, "-m", "pysess", "--daemon", session_id, str(sock_path)]
-    with open(os.devnull, "rb") as devnull_in, open(os.devnull, "wb") as devnull_out:
+    devnull = Path(os.devnull)
+    with devnull.open("rb") as devnull_in, devnull.open("wb") as devnull_out:
         proc = subprocess.Popen(
             cmd,
             stdin=devnull_in,
@@ -642,7 +596,7 @@ def _spawn_daemon(session_id: str) -> None:
     while time.monotonic() < deadline:
         if sock_path.exists():
             try:
-                if _send_request(session_id, {"op": "ps"}).get("status") == "ok":
+                if send_request(session_id, {"op": "ps"}).get("status") == "ok":
                     return
             except RuntimeError:
                 pass
@@ -698,6 +652,12 @@ def _format_session_status(
     return "".join(parts)
 
 
+def _format_ps_venv(info: dict[str, Any] | None) -> str:
+    if not info:
+        return "venv=-"
+    return "venv=private" if info.get("private") else f"venv={info['name']}"
+
+
 def _format_ps_rows(rows: list[dict[str, Any]]) -> list[str]:
     table = [
         [
@@ -705,6 +665,7 @@ def _format_ps_rows(rows: list[dict[str, Any]]) -> list[str]:
             f"pid={resp['pid']}",
             f"state={resp['state']}",
             f"idle={_format_idle_duration(resp['idle_seconds'])}",
+            _format_ps_venv(resp.get("venv")),
             f"vars={len(resp.get('vars', {}))}",
         ]
         for resp in rows
@@ -867,7 +828,81 @@ def build_parser() -> argparse.ArgumentParser:
     kill_group.add_argument("session_id", nargs="?", metavar="ID", help="Target session ID.")
     kill_group.add_argument("--all", action="store_true", help="Stop all active sessions.")
 
+    venv_parser = subparsers.add_parser(
+        "venv",
+        help="List or remove venvs created with the `pysess.venv` Python API.",
+        description=(
+            "Venvs are created and populated from Python inside a session, e.g. "
+            "`import pysess; pysess.venv.install('httpx')`. See `help(pysess.venv)`."
+        ),
+    )
+    venv_sub = venv_parser.add_subparsers(dest="venv_command", required=True)
+    venv_sub.add_parser("ls", help="List shared and private venvs.")
+    rm_parser = venv_sub.add_parser(
+        "rm",
+        help="Remove shared venvs, or private venvs left behind by dead sessions.",
+    )
+    rm_parser.add_argument("names", nargs="*", metavar="NAME", help="Venv name(s) to remove.")
+    rm_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Remove all shared venvs and all orphaned private venvs.",
+    )
+
     return parser
+
+
+def _format_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "K", "M"):
+        if size < 1024:
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}G"
+
+
+def _cmd_venv(args: argparse.Namespace) -> int:
+    items = venv.list()
+
+    if args.venv_command == "ls":
+        if not items:
+            print("No venvs.")
+            return 0
+        table = [
+            [
+                item.name,
+                "private" if item.private else "shared",
+                f"python={item.python_version or '?'}",
+                f"size={_format_size(item.size())}",
+                f"packages={len(item.packages())}",
+                "incompatible" if not item.compatible else "orphaned" if item.orphaned else "",
+            ]
+            for item in items
+        ]
+        widths = [max(len(row[i]) for row in table) for i in range(len(table[0]))]
+        for row in table:
+            print("  ".join(f"{col:<{widths[i]}}" for i, col in enumerate(row)).rstrip())
+        return 0
+
+    # rm
+    if bool(args.names) == args.all:
+        print("pysess: venv rm: give NAME(s) or --all.", file=sys.stderr)
+        return 2
+    targets: list[str | venv.Venv] = (
+        [item for item in items if not item.private or item.orphaned] if args.all else args.names
+    )
+    if not targets:
+        print("No venvs to remove.")
+    rc = 0
+    for target in targets:
+        try:
+            venv.remove(target)
+        except RuntimeError as exc:
+            print(f"pysess: {exc}", file=sys.stderr)
+            rc = 1
+            continue
+        print(f"[pysess: venv {target if isinstance(target, str) else target.name} | removed]")
+    return rc
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -891,7 +926,7 @@ def main(argv: list[str] | None = None) -> None:
                 sock_path = socket_path(sid)
                 if sock_path.exists():
                     try:
-                        _send_request(sid, {"op": "ps"})
+                        send_request(sid, {"op": "ps"})
                     except RuntimeError:
                         with contextlib.suppress(OSError):
                             sock_path.unlink()
@@ -904,7 +939,7 @@ def main(argv: list[str] | None = None) -> None:
             rc = (
                 _emit_step_output(
                     sid,
-                    _send_request(sid, {"op": "exec", "code": code, "timeout": timeout}),
+                    send_request(sid, {"op": "exec", "code": code, "timeout": timeout}),
                 )
                 if code.strip()
                 else 0
@@ -912,16 +947,16 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "exec":
             code = _read_code(args.code, args.file, read_stdin_tty_safe=False)
             timeout = 0.0 if args.detach else args.timeout
-            resp = _send_request(
+            resp = send_request(
                 args.session_id,
                 {"op": "exec", "code": code, "timeout": timeout},
             )
             rc = _emit_step_output(args.session_id, resp)
         elif args.command == "wait":
-            resp = _send_request(args.session_id, {"op": "wait", "timeout": args.timeout})
+            resp = send_request(args.session_id, {"op": "wait", "timeout": args.timeout})
             rc = _emit_step_output(args.session_id, resp)
         elif args.command == "cancel":
-            resp = _send_request(args.session_id, {"op": "cancel"})
+            resp = send_request(args.session_id, {"op": "cancel"})
             if resp.get("status") == "idle":
                 print(_format_session_status(args.session_id, "idle"))
                 rc = 0
@@ -931,7 +966,7 @@ def main(argv: list[str] | None = None) -> None:
                     rc = 1
         elif args.command == "ps":
             if args.session_id:
-                resp = _send_request(args.session_id, {"op": "ps"})
+                resp = send_request(args.session_id, {"op": "ps"})
                 print(_format_ps_rows([resp])[0])
                 if user_vars := resp.get("vars", {}):
                     print("vars:")
@@ -941,26 +976,21 @@ def main(argv: list[str] | None = None) -> None:
                 else:
                     print("vars: (none)")
             else:
-                rows: list[dict[str, Any]] = []
-                for sock_file in sorted(runtime_dir().glob("*.sock")):
-                    try:
-                        rows.append(_send_request(sock_file.stem, {"op": "ps"}))
-                    except RuntimeError:
-                        with contextlib.suppress(OSError):
-                            sock_file.unlink()
-                        continue
+                rows = list(live_sessions())
                 if rows:
                     for line in _format_ps_rows(rows):
                         print(line)
                 else:
                     print("No active sessions.")
             rc = 0
+        elif args.command == "venv":
+            rc = _cmd_venv(args)
         else:  # kill
             if args.all:
                 killed_any = False
                 for sock_file in sorted(runtime_dir().glob("*.sock")):
                     try:
-                        _send_request(sock_file.stem, {"op": "kill"})
+                        send_request(sock_file.stem, {"op": "kill"})
                     except RuntimeError:
                         with contextlib.suppress(OSError):
                             sock_file.unlink()
@@ -970,7 +1000,7 @@ def main(argv: list[str] | None = None) -> None:
                 if not killed_any:
                     print("No active sessions.")
             else:
-                _send_request(args.session_id, {"op": "kill"})
+                send_request(args.session_id, {"op": "kill"})
                 print(_format_session_status(args.session_id, "killed"))
             rc = 0
     except (OSError, RuntimeError) as exc:

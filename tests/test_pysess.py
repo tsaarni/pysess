@@ -37,6 +37,7 @@ def _run_cli(
         capture_output=True,
         env=env,
         timeout=15,
+        check=False,
     )
 
 

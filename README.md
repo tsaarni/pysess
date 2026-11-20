@@ -2,7 +2,7 @@
 
 Persistent Python REPL sessions for coding agents.
 
-`pysess` keeps a Python interpreter running in the background and gives you CLI access to it. It lets coding agents work in Python across separate shell calls, keeping imports, variables, and connections in memory instead of starting fresh or passing all intermediate data through the context window. It uses only the Python standard library. See [SKILL.md](SKILL.md) for the agent skill definition.
+`pysess` keeps a Python interpreter running in the background and gives you CLI access to it. It lets coding agents work in Python across separate shell calls, keeping imports, variables, and connections in memory instead of starting fresh or passing all intermediate data through the context window. It uses only the Python standard library (installing packages at runtime additionally requires the `uv` executable). See [SKILL.md](SKILL.md) for the agent skill definition.
 
 ## Usage
 
@@ -16,6 +16,16 @@ Persistent Python REPL sessions for coding agents.
 | `pysess cancel ID` | Interrupt the running step in `ID` with `KeyboardInterrupt` while keeping session state alive. |
 | `pysess ps [ID]` | List active sessions, or inspect `ID` for state, running location, idle time, and variables. |
 | `pysess kill [ID \| --all]` | Stop session `ID` (or all sessions with `--all`) and remove socket files. |
+| `pysess venv ls` | List venvs created with the `pysess.venv` Python API, with Python version, size, and packages. |
+| `pysess venv rm NAME... \| --all` | Remove shared venvs, or private venvs left behind by dead sessions. |
+
+## Installing Packages at Runtime
+
+Inside a session, `import pysess` gives access to `pysess.venv`, which installs packages with [`uv`](https://docs.astral.sh/uv/) into ephemeral virtual environments and adds them to the running interpreter, without writing to user-wide site-packages. Each session gets a private venv deleted when it ends, or sessions can share a named venv. See [SKILL.md](SKILL.md) for the full API.
+
+```bash
+pysess new -t 60 -c 'import pysess; pysess.venv.install("httpx"); import httpx'
+```
 
 ## Session Logging
 
@@ -46,6 +56,26 @@ Example `/tmp/pysess-logs/20261117-202636-audited-session.log`:
 0
 1
 ```
+
+## Configuration
+
+| Environment variable | Default | Description |
+| --- | --- | --- |
+| `PYSESS_RUNTIME_DIR` | `/tmp/pysess-<uid>` | Directory for session sockets and venvs. Must be owned by the user with mode `0700`. Sessions are only visible to `pysess` commands that use the same directory. |
+| `PYSESS_IDLE_TIMEOUT` | `3600` | Seconds without activity before a session exits; `0` or negative disables. |
+| `PYSESS_LOG_DIR` | unset (no logging) | Directory for session transcripts, see [Session Logging](#session-logging). |
+| `PYSESS_UV` | `uv` from `PATH` | `uv` executable used by `pysess.venv`. |
+| `UV_CACHE_DIR` (uv's own) | `~/.cache/uv` | Download and wheel cache written by `uv` when installing packages. |
+
+Directories, relative to the runtime directory:
+
+| Path | Content | Lifetime |
+| --- | --- | --- |
+| `<id>.sock` | Unix socket of session `<id>` | Until the session ends |
+| `sessions/<id>/venv/` | Private venv of session `<id>` | Until the session ends |
+| `venvs/<name>/` | Shared venv `<name>` | Until `pysess venv rm <name>`, or until the OS clears `/tmp` |
+
+The default is `/tmp/pysess-<uid>` (the same convention as tmux) rather than `$XDG_RUNTIME_DIR`, so a sandboxed agent only needs access to that directory, not to `/run/user/<uid>`, which holds keyring, D-Bus, and other session sockets. Many systems clear `/tmp` at boot and delete entries unused for some time (systemd's default is 10 days, some distributions use 30), which can remove a long-unused shared venv.
 
 ## Installation
 

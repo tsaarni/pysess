@@ -49,3 +49,16 @@ pysess kill k9x2
   - Once it finishes, the next `pysess exec <id>` flushes its unread output automatically.
   - While still running, use `pysess wait <id>` (`-t 0` to poll) or `pysess cancel <id>` (`KeyboardInterrupt`).
 - Use `pysess ps [<id>]` to inspect sessions, blocked locations, and variables; use `pysess kill <id>` or `pysess kill --all` to clean up.
+
+## Installing packages
+- Never `pip install` into the user's Python. Inside the session, run `import pysess; pysess.venv.install("pkg", ...)` and then import the package; it goes into a private venv deleted when the session ends. Pass `-t 60` or more, since downloads can take longer than the default timeout.
+- To reuse packages across sessions, first call `pysess.venv.use("<name>")` (shared venv, kept until removed), then `install(...)`. Installing into or removing a shared venv affects every session using it.
+- API (`help(pysess.venv)` for details):
+  - `install(*packages, upgrade=False)`: install requirement specifiers or local paths into the attached venv (the private venv if none is attached).
+  - `use(name=None)`: attach shared venv `name`, or the session's private venv if omitted; created if needed, and any other venv is detached.
+  - `detach()`: detach the venv, undoing its `sys.path`, `PATH`, and `VIRTUAL_ENV` changes.
+  - `current()`: the attached `Venv` (`name`, `private`, `path`, `packages()`) or `None`.
+  - `list()` / `remove(name)`: list venvs, or delete a shared venv (or an orphaned private venv).
+- Modules already imported from a venv stay loaded after `detach()` or switching venvs; prefer switching before importing.
+- `sys.executable` stays the pysess interpreter; for subprocesses use `python` from `PATH`, which is the venv's.
+- From bash, `pysess venv ls` lists venvs and `pysess venv rm <name>` removes a shared venv you no longer need.

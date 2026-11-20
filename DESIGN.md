@@ -56,7 +56,27 @@ When a detached step (such as `srv.accept()`) finishes in the background after a
 - **Guarded `SIGINT` handler:** The main thread installs a custom `SIGINT` handler that only raises `KeyboardInterrupt` while `self._in_user_code` is `True` (paired with a `job.cancel_requested` pre-check). This eliminates the race window where a late `SIGINT` from `cancel` arrives just as a job finishes and crashes the daemon loop.
 - **Deterministic `kill` with watchdog:** `pysess kill` unlinks the socket immediately, interrupts any running job on the main thread, and starts a 0.5s fallback watchdog (`atexit._run_exitfuncs()` + `os._exit(0)`) in case user code traps `BaseException`.
 - **`SystemExit` delivery synchronization:** If user code calls `sys.exit(...)`, the main thread waits on `job.delivered_event` so the control thread finishes writing the socket response before the daemon process exits.
-- **Socket & runtime directory security:** `runtime_dir()` verifies via `lstat()` that the socket directory is a real directory (not a symlink), is owned by `os.getuid()`, and has `0o700` permissions. `socket_path()` validates session IDs against `^[a-z0-9]{1,32}$` to prevent path traversal.
+- **Socket & runtime directory security:** `runtime_dir()` verifies via `lstat()` that the socket directory is a real directory (not a symlink), is owned by `os.getuid()`, and has `0o700` permissions. `socket_path()` validates session IDs against `^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$` to prevent path traversal.
+- **Default runtime directory `/tmp/pysess-<uid>`:** Like tmux's `/tmp/tmux-<uid>`. `$XDG_RUNTIME_DIR` (`/run/user/<uid>`) was rejected because it also holds keyring, gpg-agent, D-Bus, and audio sockets: a sandboxed agent would need write access there just so pysess can create its subdirectory. In the shared `/tmp`, the ownership and mode checks above mean another user can at most create the path first, so pysess refuses to start, but cannot read or plant files in it. `/tmp` is hard-coded rather than taken from `$TMPDIR`, so a sandbox and the user's terminal agree on the location. `PYSESS_RUNTIME_DIR` overrides it.
+
+### 1.7 Runtime Package Installation (`pysess.venv`)
+Agents often need a third-party package mid-session, but must not write to user-wide locations (`~/.local/lib/python*/site-packages`, the `uv tool` environment of pysess itself).
+
+- **Python API, not CLI:** Inside a session, `import pysess` returns the package the daemon already runs from. `pysess.venv` functions run as ordinary user code on the main thread, so they get output capture, `-d`/`wait`/`cancel`, and composability (`try: import x except ImportError: install(...)`) for free, and `sys.path` is never mutated concurrently with user code. The CLI only has `pysess venv ls`/`rm` to manage venvs when no session is running.
+- **Overlay instead of re-spawning:** The daemon keeps running on the pysess interpreter. A venv is created with `uv venv --python sys.executable`, populated with `uv pip install --python <venv>/bin/python`, and attached with `site.addsitedir()` + `importlib.invalidate_caches()`. This allows installing into, and switching venvs of, a running session. uv has no library API, so it is invoked as a subprocess; its output is streamed to `sys.stderr` because the daemon's file descriptors point to `/dev/null`.
+- **Attaching details:**
+  - Entries added by `addsitedir` (the venv's `site-packages` and paths added by its `.pth` files) are recorded and moved before the interpreter's own site-packages, so the venv takes precedence. `detach()` removes exactly those entries.
+  - `<venv>/bin` is prepended to `PATH` and `VIRTUAL_ENV` is set so subprocesses running `python` use the venv; `sys.executable` is not changed. `detach()` removes only that `PATH` entry and restores `VIRTUAL_ENV` only if it still points at the venv, so other environment changes are kept.
+  - Code executed by `.pth` files and modules already imported cannot be unloaded; `detach()` and switching print the top-level modules that remain loaded.
+- **Private vs. shared:** `use()` (or `install()` with no venv attached) creates and attaches the session's private venv (`sessions/<id>/venv`). The daemon deletes it after its main loop exits (so `kill` is answered first), and on start of a session with the same ID (left over after `SIGKILL`). `use(name)` attaches a shared venv (`venvs/<name>`) that outlives sessions until `remove()`/`pysess venv rm`. Venvs always live in the runtime directory, so session IDs, and therefore private venvs, cannot collide.
+- **Deliberately unguarded:** Installing into or removing a shared venv affects every session using it; there is no cross-session in-use check or locking. Sharing is opt-in, `uv pip install` locks the venv itself so concurrent installs cannot corrupt it, `uv venv --allow-existing` tolerates concurrent creation, and the worst case for another session is a failed or mismatched import. The one guard kept is the interpreter check: a venv is attached only if `realpath(<venv>/bin/python) == realpath(sys.executable)`, since compiled extensions built for another Python crash or misbehave.
+
+```text
+<runtime dir>/             0700
+  <id>.sock                session sockets
+  venvs/<name>/            shared venvs
+  sessions/<id>/venv/      private venv of session <id>
+```
 
 ---
 
@@ -66,7 +86,7 @@ When a detached step (such as `srv.accept()`) finishes in the background after a
 sequenceDiagram
     participant Agent as Coding Agent (Bash Tool)
     participant CLI as pysess CLI
-    participant Sock as Unix Socket ($XDG_RUNTIME_DIR/pysess-<uid>/<id>.sock)
+    participant Sock as Unix Socket (/tmp/pysess-<uid>/<id>.sock)
     participant Daemon as SessionDaemon (Control Thread + Main Thread)
 
     Agent->>CLI: pysess new -t 1 (bind srv + srv.accept())
@@ -137,6 +157,8 @@ Subcommands:
   cancel <id>                         Interrupt the running step in <id> with KeyboardInterrupt
   ps [<id>]                           List active sessions (or inspect <id> state, location, and variables)
   kill [<id> | --all]                 Stop session(s) cleanly and remove socket files
+  venv ls                             List venvs created with the pysess.venv Python API
+  venv rm <name>... | --all           Remove shared venvs or orphaned private venvs
 ```
 
 Default timeouts (`-t SEC` accepts fractional seconds, e.g. `-t 0.2`):
@@ -145,6 +167,8 @@ Default timeouts (`-t SEC` accepts fractional seconds, e.g. `-t 0.2`):
 
 ### 3.2 Package Layout
 
-- `src/pysess/cli.py`: Single-file implementation containing the CLI parser (`build_parser`), entrypoint (`main`), `SessionDaemon`, incremental stream buffer, AST evaluator, and runtime socket helpers.
+- `src/pysess/cli.py`: CLI parser (`build_parser`), entrypoint (`main`), `SessionDaemon`, incremental stream buffer, and AST evaluator.
+- `src/pysess/_runtime.py`: Runtime directory and socket helpers, session request client, and `pysess.Error`, shared by the CLI and the Python API.
+- `src/pysess/venv.py`: `pysess.venv` Python API for ephemeral virtual environments.
 - `src/pysess/__main__.py`: Module entrypoint (`python -m pysess`).
-- `src/pysess/__init__.py`: Package docstring.
+- `src/pysess/__init__.py`: Public Python API (`pysess.venv`, `pysess.Error`); future controls get their own submodule.
