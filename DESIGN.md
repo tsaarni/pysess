@@ -45,7 +45,7 @@ A critical finding from CPython internals (`Python/ceval.c` and PEP 475) drives 
 ### 1.4 Zero-Turn Penalty When Coming Back After a Blocking Call Finishes
 When a detached step (such as `srv.accept()`) finishes in the background after an external command (like `curl`) connects to it:
 - The agent does **not** need to spend an extra turn calling `pysess wait <id>` before running its next `pysess exec <id>`.
-- When `pysess exec <id>` arrives and sees that the previous detached job has already completed (`done_event.is_set() and not result_delivered`), it **automatically flushes the completed background job's unread `stdout`/`stderr`** before executing the new code.
+- When `pysess exec <id>` arrives and the previous detached job has already completed, its **unread `stdout`/`stderr` is returned together with the new step's output**. The daemon keeps one read position per stream for the whole session (see 1.8), so output not yet delivered to a client, including output a background process wrote after its step finished, is returned by the next `exec` or `wait`.
 
 ### 1.5 Authentic `__main__` Module & Context-Window Guardrails
 - **Real `sys.modules["__main__"]` backing:** The session namespace is backed by a genuine `types.ModuleType("__main__")` registered in `sys.modules["__main__"]` with `__builtins__ = builtins` (the module, not a `dict`). This ensures standard library tools that resolve symbols via `sys.modules[cls.__module__]`—such as `dataclasses` with `from __future__ import annotations`, `typing.get_type_hints()`, `pickle`, and `inspect`—work identically to standard Python.
@@ -63,7 +63,7 @@ When a detached step (such as `srv.accept()`) finishes in the background after a
 Agents often need a third-party package mid-session, but must not write to user-wide locations (`~/.local/lib/python*/site-packages`, the `uv tool` environment of pysess itself).
 
 - **Python API, not CLI:** Inside a session, `import pysess` returns the package the daemon already runs from. `pysess.venv` functions run as ordinary user code on the main thread, so they get output capture, `-d`/`wait`/`cancel`, and composability (`try: import x except ImportError: install(...)`) for free, and `sys.path` is never mutated concurrently with user code. The CLI only has `pysess venv ls`/`rm` to manage venvs when no session is running.
-- **Overlay instead of re-spawning:** The daemon keeps running on the pysess interpreter. A venv is created with `uv venv --python sys.executable`, populated with `uv pip install --python <venv>/bin/python`, and attached with `site.addsitedir()` + `importlib.invalidate_caches()`. This allows installing into, and switching venvs of, a running session. uv has no library API, so it is invoked as a subprocess; its output is streamed to `sys.stderr` because the daemon's file descriptors point to `/dev/null`.
+- **Overlay instead of re-spawning:** The daemon keeps running on the pysess interpreter. A venv is created with `uv venv --python sys.executable`, populated with `uv pip install --python <venv>/bin/python`, and attached with `site.addsitedir()` + `importlib.invalidate_caches()`. This allows installing into, and switching venvs of, a running session. uv has no library API, so it is invoked as a subprocess with its output written to the session's stderr.
 - **Attaching details:**
   - Entries added by `addsitedir` (the venv's `site-packages` and paths added by its `.pth` files) are recorded and moved before the interpreter's own site-packages, so the venv takes precedence. `detach()` removes exactly those entries.
   - `<venv>/bin` is prepended to `PATH` and `VIRTUAL_ENV` is set so subprocesses running `python` use the venv; `sys.executable` is not changed. `detach()` removes only that `PATH` entry and restores `VIRTUAL_ENV` only if it still points at the venv, so other environment changes are kept.
@@ -77,6 +77,15 @@ Agents often need a third-party package mid-session, but must not write to user-
   venvs/<name>/            shared venvs
   sessions/<id>/venv/      private venv of session <id>
 ```
+
+### 1.8 Output Capture on File Descriptors 1 and 2
+Redirecting `sys.stdout`/`sys.stderr` only captures Python-level writes. Child processes (`subprocess.run()`, `os.system()`, subprocesses started by libraries) and C code write to file descriptors 1 and 2, which pointed to `/dev/null`, so their output was silently lost and looked like a command that printed nothing.
+
+- **Unlinked files instead of pipes:** At start, the daemon points descriptors 1 and 2 at two files created with `tempfile.TemporaryFile()` (`O_TMPFILE`, no name in the runtime directory) in append mode. Responses read new output with `os.pread()` from a per-stream read position. A pipe would need a reader thread and an end-of-step marker to know all output has arrived, and blocks every writer once the reader stops. With a file, everything written by a finished step is already there, and writers never block.
+- **One stream shared by Python and child processes:** The daemon runs with `python -u`, so `sys.stdout`/`sys.stderr` write straight to the descriptors without buffering, and the order between Python output and child process output is kept. `sys.__stdout__` and `sys.stdout.buffer` work as in a normal interpreter. Reassignments of `sys.stdout`/`sys.stderr` are undone after each step, and pysess writes tracebacks to the original `sys.stderr`.
+- **Output after a step finished:** Background processes and threads keep writing to the same files. The output is returned by the next `exec` or `wait` (before that step's own output) and written to the session log before the next cell.
+- **Lifetime:** The kernel frees the files when the last descriptor closes, so nothing is left behind even after `SIGKILL`. A child process that outlives the session keeps its file open until it exits. The files grow for the lifetime of the session; output read by clients is not truncated.
+- **Limitations:** C code using stdio (`printf`) buffers output in the C library until it is flushed. The session log records each step's `stdout` followed by its `stderr`, not their interleaving.
 
 ---
 
@@ -167,7 +176,7 @@ Default timeouts (`-t SEC` accepts fractional seconds, e.g. `-t 0.2`):
 
 ### 3.2 Package Layout
 
-- `src/pysess/cli.py`: CLI parser (`build_parser`), entrypoint (`main`), `SessionDaemon`, incremental stream buffer, and AST evaluator.
+- `src/pysess/cli.py`: CLI parser (`build_parser`), entrypoint (`main`), `SessionDaemon`, output capture, and AST evaluator.
 - `src/pysess/_runtime.py`: Runtime directory and socket helpers, session request client, and `pysess.Error`, shared by the CLI and the Python API.
 - `src/pysess/venv.py`: `pysess.venv` Python API for ephemeral virtual environments.
 - `src/pysess/__main__.py`: Module entrypoint (`python -m pysess`).

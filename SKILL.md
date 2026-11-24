@@ -48,6 +48,7 @@ pysess kill k9x2
 - When a step is running in the background (`[pysess: <id> | running ...]`):
   - Once it finishes, the next `pysess exec <id>` flushes its unread output automatically.
   - While still running, use `pysess wait <id>` (`-t 0` to poll) or `pysess cancel <id>` (`KeyboardInterrupt`).
+- Output that background processes or threads write after their step finished appears at the start of the next `exec` or `wait`. Redirect noisy background processes (e.g. `Popen(..., stdout=subprocess.DEVNULL)` or a log file) to keep later output clean.
 - Use `pysess ps [<id>]` to inspect sessions, blocked locations, and variables; use `pysess kill <id>` or `pysess kill --all` to clean up.
 
 ## Installing packages

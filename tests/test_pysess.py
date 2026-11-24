@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from pysess.cli import _format_idle_duration, _format_repl_cell, _IncrementalBuffer, build_parser
+from pysess.cli import _format_idle_duration, _format_repl_cell, build_parser
 
 
 @pytest.fixture
@@ -297,19 +297,7 @@ def test_kill_idle_session(runtime_env: dict[str, str]) -> None:
     assert "No active sessions." in ps_res.stdout
 
 
-def test_incremental_buffer_clears_chunks_and_exposes_encoding(
-    runtime_env: dict[str, str],
-) -> None:
-    buf = _IncrementalBuffer()
-    assert buf.encoding == "utf-8"
-    assert buf.errors == "replace"
-    assert buf.isatty() is False
-    buf.write("hello ")
-    buf.write("world")
-    assert buf.read_delta() == "hello world"
-    assert buf._chunks == []
-    assert buf.read_delta() == ""
-
+def test_session_stdout_encoding_is_utf8(runtime_env: dict[str, str]) -> None:
     res = _run_cli("new", "-c", "import sys; print(sys.stdout.encoding)", env=runtime_env)
     assert res.returncode == 0
     sid = _extract_session_id(res.stdout)
@@ -528,3 +516,68 @@ def test_session_log_dir_records_repl_transcript(runtime_env: dict[str, str]) ->
         )
         assert re.search(expected_re, content) is not None, content
         assert "ZeroDivisionError: division by zero\n" in content
+
+
+def test_fd_level_output_from_subprocesses_is_captured(runtime_env: dict[str, str]) -> None:
+    res = _run_cli("new", "-n", "fdcap", "-c", "import os, subprocess, sys", env=runtime_env)
+    assert res.returncode == 0, res.stderr
+    try:
+        code = (
+            "print('before')\n"
+            "subprocess.run(['sh', '-c', 'echo child-out; echo child-err >&2'])\n"
+            "os.system('echo from-system')\n"
+            "os.write(1, b'raw-fd\\n')\n"
+            "print('after')\n"
+        )
+        res = _run_cli("exec", "fdcap", "-c", code, env=runtime_env)
+        assert res.returncode == 0, res.stderr
+        # Python and child-process output share one pipe, so their order is kept.
+        assert res.stdout.splitlines() == ["before", "child-out", "from-system", "raw-fd", "after"]
+        assert res.stderr.strip() == "child-err"
+
+        res = _run_cli("exec", "fdcap", "-c", "print('ü', end='')\n1 / 0", env=runtime_env)
+        assert res.returncode == 1
+        assert res.stdout == "ü"
+        assert "ZeroDivisionError" in res.stderr
+    finally:
+        _run_cli("kill", "fdcap", env=runtime_env)
+
+
+def test_output_after_step_finished_is_delivered_later(runtime_env: dict[str, str]) -> None:
+    res = _run_cli("new", "-n", "late", "-c", "import subprocess", env=runtime_env)
+    assert res.returncode == 0, res.stderr
+    try:
+        res = _run_cli(
+            "exec",
+            "late",
+            "-c",
+            "p = subprocess.Popen(['sh', '-c', 'sleep 0.3; echo late-out'])",
+            env=runtime_env,
+        )
+        assert res.returncode == 0, res.stderr
+        assert "late-out" not in res.stdout
+        time.sleep(0.6)
+
+        res = _run_cli("exec", "late", "-c", "p.wait()", env=runtime_env)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.splitlines() == ["late-out", "0"]
+    finally:
+        _run_cli("kill", "late", env=runtime_env)
+
+
+def test_reassigned_sys_streams_are_restored_after_step(runtime_env: dict[str, str]) -> None:
+    res = _run_cli(
+        "new", "-n", "streams", "-c", "import io, sys; sys.stderr = io.StringIO()", env=runtime_env
+    )
+    assert res.returncode == 0, res.stderr
+    try:
+        res = _run_cli("exec", "streams", "-c", "1 / 0", env=runtime_env)
+        assert res.returncode == 1
+        assert "ZeroDivisionError" in res.stderr
+
+        code = "sys.__stdout__.write('a\\n')\nsys.stdout.buffer.write(b'b\\n')\nprint('c', end='')"
+        res = _run_cli("exec", "streams", "-c", code, env=runtime_env)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout == "a\nb\nc"
+    finally:
+        _run_cli("kill", "streams", env=runtime_env)

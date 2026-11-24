@@ -281,29 +281,20 @@ def _remove_paths(paths: builtins.list[str]) -> None:
 
 
 def _run_uv(*args: str) -> None:
-    """Run uv, streaming its output to `sys.stderr` (captured by the session)."""
+    """Run uv with its output written to the session's stderr (file descriptor 2)."""
     if (exe := shutil.which(os.environ.get("PYSESS_UV") or "uv")) is None:
         raise Error("The `uv` executable was not found (install uv or set PYSESS_UV).")
-    proc = subprocess.Popen(
-        [exe, "--color", "never", *args],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        errors="replace",
-    )
-    with proc:
-        try:
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                sys.stderr.write(line)
-        except BaseException:
-            proc.kill()
-            sys.stderr.write(
-                f"pysess: `uv {args[0]} {args[1]}` interrupted; the venv may be partially "
-                "updated. Run the same call again to complete it.\n"
-            )
-            raise
+    try:
+        # `subprocess.run()` kills uv if the step is interrupted.
+        proc = subprocess.run(
+            [exe, "--color", "never", *args], stdin=subprocess.DEVNULL, stdout=2, check=False
+        )
+    except BaseException:
+        sys.stderr.write(
+            f"pysess: `uv {args[0]} {args[1]}` interrupted; the venv may be partially "
+            "updated. Run the same call again to complete it.\n"
+        )
+        raise
     if proc.returncode != 0:
         raise Error(f"`uv {args[0]} {args[1]}` failed with exit code {proc.returncode}.")
 

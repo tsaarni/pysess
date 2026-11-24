@@ -6,7 +6,9 @@ import argparse
 import ast
 import atexit
 import builtins
+import codecs
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -17,11 +19,11 @@ import socket
 import string
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
 import types
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -114,50 +116,34 @@ def _open_session_log(session_id: str) -> _SessionLog | None:
     return _SessionLog(base / f"{stamp}-{session_id}.log")
 
 
-class _IncrementalBuffer(io.TextIOBase):
-    """Thread-safe incremental text buffer that clears chunks as they are read."""
+def _redirect_fd_to_unlinked_file(fd: int, directory: Path) -> None:
+    """Point file descriptor `fd` at a new, already-deleted append-only file in `directory`.
 
-    encoding: str = "utf-8"
-    errors: str | None = "replace"
+    Python's `sys.stdout`/`sys.stderr`, child processes inheriting the descriptor, and C code
+    then all write to the same open file, so their output keeps its order and nothing written
+    after a step finished is lost. The kernel frees the file when the session exits.
+    """
+    with tempfile.TemporaryFile(dir=directory) as f:
+        os.dup2(f.fileno(), fd)
+    fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_APPEND)
 
-    def __init__(self, on_write: Callable[[str], None] | None = None) -> None:
+
+class _OutputReader:
+    """Thread-safe cursor that returns text appended to file descriptor `fd` since the last read."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+        self._offset = 0
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._lock = threading.Lock()
-        self._chunks: list[str] = []
-        self._on_write = on_write
 
-    def isatty(self) -> bool:
-        return False
-
-    def writable(self) -> bool:
-        return True
-
-    def seed(self, s: str) -> None:
-        """Append previously captured text without triggering `on_write`."""
-        if not s:
-            return
+    def read(self) -> str:
         with self._lock:
-            self._chunks.append(s)
-
-    def write(self, s: str) -> int:
-        if not s:
-            return 0
-        with self._lock:
-            self._chunks.append(s)
-        if self._on_write is not None:
-            self._on_write(s)
-        return len(s)
-
-    def flush(self) -> None:
-        return None
-
-    def read_delta(self) -> str:
-        """Return and clear all text written since the previous `read_delta()` call."""
-        with self._lock:
-            if not self._chunks:
-                return ""
-            delta = "".join(self._chunks)
-            self._chunks.clear()
-            return delta
+            chunks: list[bytes] = []
+            while chunk := os.pread(self._fd, 65536, self._offset):
+                self._offset += len(chunk)
+                chunks.append(chunk)
+            return self._decoder.decode(b"".join(chunks))
 
 
 @dataclass
@@ -171,8 +157,6 @@ class _Job:
     expr_repr: str | None = None
     result_delivered: bool = False
     cancel_requested: bool = False
-    stdout_buf: _IncrementalBuffer = field(default_factory=_IncrementalBuffer)
-    stderr_buf: _IncrementalBuffer = field(default_factory=_IncrementalBuffer)
     done_event: threading.Event = field(default_factory=threading.Event)
     delivered_event: threading.Event = field(default_factory=threading.Event)
 
@@ -294,6 +278,30 @@ class SessionDaemon:
         self.session_log = _open_session_log(session_id)
         venv._session_started(session_id)
 
+        # File descriptors 1 and 2 are inherited by child processes. Point them at files
+        # that responses and the session log read back. `sys.stdout`/`sys.stderr` write to
+        # them without buffering because the daemon runs with `python -u`.
+        for fd in (1, 2):
+            _redirect_fd_to_unlinked_file(fd, self.sock_path.parent)
+        for stream in (sys.stdout, sys.stderr):
+            if isinstance(stream, io.TextIOWrapper):
+                stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        self._real_stdout = sys.stdout
+        self._real_stderr = sys.stderr
+        self._stdout = _OutputReader(1)
+        self._stderr = _OutputReader(2)
+        self._log_stdout = _OutputReader(1)
+        self._log_stderr = _OutputReader(2)
+
+    def _output_delta(self) -> dict[str, str]:
+        """Return output not yet delivered to a client, including output of earlier steps."""
+        return {"stdout_delta": self._stdout.read(), "stderr_delta": self._stderr.read()}
+
+    def _log_output(self) -> None:
+        if self.session_log is not None:
+            self.session_log.write(self._log_stdout.read())
+            self.session_log.write(self._log_stderr.read())
+
     def _cleanup(self) -> None:
         if self.session_log is not None:
             self.session_log.close()
@@ -342,16 +350,13 @@ class SessionDaemon:
             self._initiate_kill()
 
     def _job_response(self, job: _Job) -> tuple[dict[str, Any], _Job | None]:
-        stdout_delta = job.stdout_buf.read_delta()
-        stderr_delta = job.stderr_buf.read_delta()
         if not job.done_event.is_set():
             return (
                 {
                     "status": "running",
                     "elapsed": job.elapsed,
                     "location": _main_thread_location(),
-                    "stdout_delta": stdout_delta,
-                    "stderr_delta": stderr_delta,
+                    **self._output_delta(),
                 },
                 None,
             )
@@ -360,8 +365,7 @@ class SessionDaemon:
             {
                 "status": job.status,
                 "elapsed": job.elapsed,
-                "stdout_delta": stdout_delta,
-                "stderr_delta": stderr_delta,
+                **self._output_delta(),
                 "expr_repr": job.expr_repr,
             },
             job,
@@ -383,28 +387,13 @@ class SessionDaemon:
                             "status": "busy",
                             "elapsed": running.elapsed,
                             "location": _main_thread_location(),
-                            "stdout_delta": running.stdout_buf.read_delta(),
-                            "stderr_delta": running.stderr_buf.read_delta(),
+                            **self._output_delta(),
                         },
                         None,
                     )
-                prev_stdout = ""
-                prev_stderr = ""
-                if self.current_job is not None and not self.current_job.result_delivered:
-                    prev_stdout = self.current_job.stdout_buf.read_delta()
-                    prev_stderr = self.current_job.stderr_buf.read_delta()
-                    self.current_job.result_delivered = True
-
-                on_output = self.session_log.write if self.session_log is not None else None
-                job = _Job(
-                    code=str(req.get("code", "")),
-                    stdout_buf=_IncrementalBuffer(on_write=on_output),
-                    stderr_buf=_IncrementalBuffer(on_write=on_output),
-                )
-                if prev_stdout:
-                    job.stdout_buf.seed(prev_stdout)
-                if prev_stderr:
-                    job.stderr_buf.seed(prev_stderr)
+                # Output not yet delivered (of earlier steps, or written by child processes
+                # and threads after they finished) is returned with this step's output.
+                job = _Job(code=str(req.get("code", "")))
                 self.current_job = job
                 self.work_queue.put(job)
 
@@ -416,20 +405,11 @@ class SessionDaemon:
             timeout = float(req.get("timeout", DEFAULT_WAIT_TIMEOUT))
             with self.state_lock:
                 job = self.current_job
-            if job is None:
-                return ({"status": "idle", "stdout_delta": "", "stderr_delta": ""}, None)
-            if not job.done_event.is_set() and timeout > 0:
+            if job is not None and not job.done_event.is_set() and timeout > 0:
                 job.done_event.wait(timeout=timeout)
             with self.state_lock:
-                if job.done_event.is_set() and job.result_delivered:
-                    return (
-                        {
-                            "status": "idle",
-                            "stdout_delta": job.stdout_buf.read_delta(),
-                            "stderr_delta": job.stderr_buf.read_delta(),
-                        },
-                        None,
-                    )
+                if job is None or (job.done_event.is_set() and job.result_delivered):
+                    return ({"status": "idle", **self._output_delta()}, None)
                 return self._job_response(job)
 
         if op == "cancel":
@@ -526,46 +506,46 @@ class SessionDaemon:
 
                 exited_via_sys_exit = False
                 if self.session_log is not None:
+                    self._log_output()  # written by child processes or threads since last step
                     ts = datetime.now().astimezone().isoformat(timespec="seconds")
                     self.session_log.write(
                         f"# pysess {ts}\n{_format_repl_cell(job.code)}",
                         ensure_bol=True,
                     )
-                with (
-                    contextlib.redirect_stdout(job.stdout_buf),
-                    contextlib.redirect_stderr(job.stderr_buf),
-                ):
-                    try:
-                        self._in_user_code = True
-                        if job.cancel_requested:
-                            raise KeyboardInterrupt
-                        job.expr_repr = _execute_cell(job.code, self.namespace)
-                        self._in_user_code = False
-                        if self.session_log is not None and job.expr_repr is not None:
-                            self.session_log.write(f"{job.expr_repr}\n", ensure_bol=True)
-                        job.status = "ok"
-                    except BaseException as exc:  # noqa: BLE001 - user code may raise anything
-                        self._in_user_code = False
-                        if isinstance(exc, SystemExit):
-                            if exc.code in (None, 0):
-                                job.status = "ok"
-                            elif isinstance(exc.code, int):
-                                job.stderr_buf.write(_format_repl_traceback(exc))
-                                job.status = "error"
-                            else:
-                                job.stderr_buf.write(f"{exc.code}\n")
-                                job.status = "error"
-                            exited_via_sys_exit = True
-                            self.shutdown_event.set()
-                        else:
-                            job.stderr_buf.write(_format_repl_traceback(exc))
+                try:
+                    self._in_user_code = True
+                    if job.cancel_requested:
+                        raise KeyboardInterrupt
+                    job.expr_repr = _execute_cell(job.code, self.namespace)
+                    self._in_user_code = False
+                    job.status = "ok"
+                except BaseException as exc:  # noqa: BLE001 - user code may raise anything
+                    self._in_user_code = False
+                    if isinstance(exc, SystemExit):
+                        if exc.code in (None, 0):
+                            job.status = "ok"
+                        elif isinstance(exc.code, int):
+                            self._real_stderr.write(_format_repl_traceback(exc))
                             job.status = "error"
-                    finally:
-                        self._in_user_code = False
-                        with self.state_lock:
-                            self.last_activity = time.monotonic()
-                        job.finished_at = time.monotonic()
-                        job.done_event.set()
+                        else:
+                            self._real_stderr.write(f"{exc.code}\n")
+                            job.status = "error"
+                        exited_via_sys_exit = True
+                        self.shutdown_event.set()
+                    else:
+                        self._real_stderr.write(_format_repl_traceback(exc))
+                        job.status = "error"
+                finally:
+                    self._in_user_code = False
+                    # Undo reassignments of `sys.stdout`/`sys.stderr` by the step.
+                    sys.stdout, sys.stderr = self._real_stdout, self._real_stderr
+                    self._log_output()
+                    if self.session_log is not None and job.expr_repr is not None:
+                        self.session_log.write(f"{job.expr_repr}\n", ensure_bol=True)
+                    with self.state_lock:
+                        self.last_activity = time.monotonic()
+                    job.finished_at = time.monotonic()
+                    job.done_event.set()
 
                 if exited_via_sys_exit:
                     job.delivered_event.wait(timeout=1.0)
@@ -580,7 +560,7 @@ class SessionDaemon:
 
 def _spawn_daemon(session_id: str) -> None:
     sock_path = socket_path(session_id)
-    cmd = [sys.executable, "-m", "pysess", "--daemon", session_id, str(sock_path)]
+    cmd = [sys.executable, "-u", "-m", "pysess", "--daemon", session_id, str(sock_path)]
     devnull = Path(os.devnull)
     with devnull.open("rb") as devnull_in, devnull.open("wb") as devnull_out:
         proc = subprocess.Popen(

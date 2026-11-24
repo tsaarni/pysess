@@ -19,6 +19,8 @@ Persistent Python REPL sessions for coding agents.
 | `pysess venv ls` | List venvs created with the `pysess.venv` Python API, with Python version, size, and packages. |
 | `pysess venv rm NAME... \| --all` | Remove shared venvs, or private venvs left behind by dead sessions. |
 
+Output of `print()`, subprocesses, `os.system()`, and C extensions is captured in order. Output written after a step finished, for example by a background process, is shown by the next `exec` or `wait`.
+
 ## Installing Packages at Runtime
 
 Inside a session, `import pysess` gives access to `pysess.venv`, which installs packages with [`uv`](https://docs.astral.sh/uv/) into ephemeral virtual environments and adds them to the running interpreter, without writing to user-wide site-packages. Each session gets a private venv deleted when it ends, or sessions can share a named venv. See [SKILL.md](SKILL.md) for the full API.
