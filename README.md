@@ -21,6 +21,16 @@ Persistent Python REPL sessions for coding agents.
 
 Output of `print()`, subprocesses, `os.system()`, and C extensions is captured in order. Output written after a step finished, for example by a background process, is shown by the next `exec` or `wait`.
 
+## Running Blocking Calls in the Background
+
+A session runs one step at a time. To keep using it while a call blocks, `pysess.bg(fn, *args, **kwargs)` runs the call in a daemon thread and returns a `concurrent.futures.Future`. `pysess kill` still ends the session while the call is blocked.
+
+```bash
+pysess new -n web -c 'import pysess, urllib.request; req = pysess.bg(urllib.request.urlopen, "http://127.0.0.1:8080/slow", timeout=120)'
+pysess exec web -c 'req.done()'                       # False while the request waits
+pysess exec web -c 'req.result(timeout=5).status'     # re-raises the call's exception
+```
+
 ## Installing Packages at Runtime
 
 Inside a session, `import pysess` gives access to `pysess.venv`, which installs packages with [`uv`](https://docs.astral.sh/uv/) into ephemeral virtual environments and adds them to the running interpreter, without writing to user-wide site-packages. Each session gets a private venv deleted when it ends, or sessions can share a named venv. See [SKILL.md](SKILL.md) for the full API.
