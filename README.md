@@ -5,92 +5,9 @@
 
 Persistent Python REPL sessions for coding agents.
 
-`pysess` keeps a Python interpreter running in the background and gives you CLI access to it. It lets coding agents work in Python across separate shell calls, keeping imports, variables, and connections in memory instead of starting fresh or passing all intermediate data through the context window. It uses only the Python standard library (installing packages at runtime additionally requires the `uv` executable). See [SKILL.md](SKILL.md) for the agent skill definition.
-
-## Usage
+`pysess` runs a Python interpreter in the background and gives you CLI access to it. Coding agents can run Python across separate shell calls. Imports, variables, and connections stay in memory, so agents do not have to start fresh or pass intermediate data through the context window. `pysess` uses only the Python standard library. Installing packages at runtime also requires the `uv` executable. See [SKILL.md](SKILL.md) for the agent skill definition.
 
 ![pysess demo](assets/demo.svg)
-
-| Command | Description |
-| --- | --- |
-| `pysess new [-n NAME] [-t SEC \| -d] [-c CODE \| FILE]` | Start a new session (random ID or `-n`/`--name`) and optionally run code from `-c`, `FILE`, or `stdin`. |
-| `pysess exec ID [-t SEC \| -d] [-c CODE \| FILE]` | Run code in `ID` (reads `stdin` by default). Waits up to `-t`/`--timeout` (default `10`s), or use `-d`/`--detach` to run in the background. |
-| `pysess wait ID [-t SEC]` | Wait for a background step in `ID` up to `-t`/`--timeout` (default `30`s; `-t 0` to poll). |
-| `pysess cancel ID` | Interrupt the running step in `ID` with `KeyboardInterrupt` while keeping session state alive. |
-| `pysess ps [ID]` | List active sessions, or inspect `ID` for state, running location, idle time, and variables. |
-| `pysess kill [ID \| --all]` | Stop session `ID` (or all sessions with `--all`) and remove socket files. |
-| `pysess venv ls` | List venvs created with the `pysess.venv` Python API, with Python version, size, and packages. |
-| `pysess venv rm NAME... \| --all` | Remove shared venvs, or private venvs left behind by dead sessions. |
-
-Output of `print()`, subprocesses, `os.system()`, and C extensions is captured in order. Output written after a step finished, for example by a background process, is shown by the next `exec` or `wait`.
-
-## Running Blocking Calls in the Background
-
-A session runs one step at a time. To keep using it while a call blocks, `pysess.bg(fn, *args, **kwargs)` runs the call in a daemon thread and returns a `concurrent.futures.Future`. `pysess kill` still ends the session while the call is blocked.
-
-```bash
-pysess new -n web -c 'import pysess, urllib.request; req = pysess.bg(urllib.request.urlopen, "http://127.0.0.1:8080/slow", timeout=120)'
-pysess exec web -c 'req.done()'                       # False while the request waits
-pysess exec web -c 'req.result(timeout=5).status'     # re-raises the call's exception
-```
-
-## Installing Packages at Runtime
-
-Inside a session, `import pysess` gives access to `pysess.venv`, which installs packages with [`uv`](https://docs.astral.sh/uv/) into ephemeral virtual environments and adds them to the running interpreter, without writing to user-wide site-packages. Each session gets a private venv deleted when it ends, or sessions can share a named venv. See [SKILL.md](SKILL.md) for the full API.
-
-```bash
-pysess new -t 60 -c 'import pysess; pysess.venv.install("httpx"); import httpx'
-```
-
-## Session Logging
-
-Set `PYSESS_LOG_DIR` to record each session's executed cells, output, and tracebacks as a Python REPL transcript (`<YYYYMMDD-HHMMSS>-<ID>.log`). Log files are kept after `pysess kill` for auditing.
-
-```bash
-export PYSESS_LOG_DIR=/tmp/pysess-logs
-
-pysess new -n audited-session -c "x = 40
-y = 2"
-pysess exec audited-session -c "x + y"
-pysess exec audited-session -c "for i in range(2):
-    print(i)"
-```
-
-Example `/tmp/pysess-logs/20261117-202636-audited-session.log`:
-
-```python
-# pysess 2026-11-17T20:26:36+02:00
->>> x = 40
-... y = 2
-# pysess 2026-11-17T20:26:37+02:00
->>> x + y
-42
-# pysess 2026-11-17T20:26:38+02:00
->>> for i in range(2):
-...     print(i)
-0
-1
-```
-
-## Configuration
-
-| Environment variable | Default | Description |
-| --- | --- | --- |
-| `PYSESS_RUNTIME_DIR` | `/tmp/pysess-<uid>` | Directory for session sockets and venvs. Must be owned by the user with mode `0700`. Sessions are only visible to `pysess` commands that use the same directory. |
-| `PYSESS_IDLE_TIMEOUT` | `3600` | Seconds without activity before a session exits; `0` or negative disables. |
-| `PYSESS_LOG_DIR` | unset (no logging) | Directory for session transcripts, see [Session Logging](#session-logging). |
-| `PYSESS_UV` | `uv` from `PATH` | `uv` executable used by `pysess.venv`. |
-| `UV_CACHE_DIR` (uv's own) | `~/.cache/uv` | Download and wheel cache written by `uv` when installing packages. |
-
-Directories, relative to the runtime directory:
-
-| Path | Content | Lifetime |
-| --- | --- | --- |
-| `<id>.sock` | Unix socket of session `<id>` | Until the session ends |
-| `sessions/<id>/venv/` | Private venv of session `<id>` | Until the session ends |
-| `venvs/<name>/` | Shared venv `<name>` | Until `pysess venv rm <name>`, or until the OS clears `/tmp` |
-
-The default is `/tmp/pysess-<uid>` (the same convention as tmux) rather than `$XDG_RUNTIME_DIR`, so a sandboxed agent only needs access to that directory, not to `/run/user/<uid>`, which holds keyring, D-Bus, and other session sockets. Many systems clear `/tmp` at boot and delete entries unused for some time (systemd's default is 10 days, some distributions use 30), which can remove a long-unused shared venv.
 
 ## Installation
 
@@ -111,12 +28,95 @@ uv tool install --editable .
 uv tool uninstall pysess
 ```
 
-## Development
+## Usage
 
-Manage dependencies, run the CLI, and execute checks with [`uv`](https://docs.astral.sh/uv/):
+| Command | Description |
+| --- | --- |
+| `pysess new [-n NAME] [-t SEC \| -d] [-c CODE \| FILE]` | Start a new session (random ID or `-n`/`--name`) and optionally run code from `-c`, `FILE`, or `stdin`. |
+| `pysess exec ID [-t SEC \| -d] [-c CODE \| FILE]` | Run code in `ID` (reads `stdin` by default). Wait up to `-t`/`--timeout` (default `10`s), or pass `-d`/`--detach` to run in the background. |
+| `pysess wait ID [-t SEC]` | Wait for a background step in `ID` up to `-t`/`--timeout` (default `30`s; `-t 0` to poll). |
+| `pysess cancel ID` | Interrupt the running step in `ID` with `KeyboardInterrupt` and keep the session state. |
+| `pysess ps [ID]` | List active sessions, or inspect `ID` for state, running location, idle time, and variables. |
+| `pysess kill [ID \| --all]` | Stop session `ID` (or all sessions with `--all`) and remove socket files. |
+| `pysess venv ls` | List venvs created with the `pysess.venv` Python API, including Python version, size, and packages. |
+| `pysess venv rm NAME... \| --all` | Remove shared venvs, or private venvs from dead sessions. |
+
+`pysess` captures all stdout and stderr output in order, including output from `print()`, native extensions, and subprocesses. If a background process writes output after a step finishes, the next `exec` or `wait` shows it.
+
+## Running Blocking Calls in the Background
+
+A session runs one step at a time, so a blocking call keeps the session busy until it finishes. Use `pysess.bg(fn, *args, **kwargs)` to run a blocking call in a daemon thread instead. It returns a `concurrent.futures.Future`, and the session stays free for other commands. `pysess kill` still stops the session even if the background call has not finished.
 
 ```bash
-# Sync environment and dev dependencies
+pysess new -n web -c 'import pysess, urllib.request; req = pysess.bg(urllib.request.urlopen, "http://127.0.0.1:8080/slow", timeout=120)'
+pysess exec web -c 'req.done()'                       # False while the request waits
+pysess exec web -c 'req.result(timeout=5).status'     # re-raises the call's exception
+```
+
+## Installing Packages at Runtime
+
+Inside a session, `import pysess` gives you `pysess.venv`. It uses [`uv`](https://docs.astral.sh/uv/) to install packages into temporary virtual environments and adds them to the running interpreter. It never writes to user-wide site-packages. Each session gets a private venv that `pysess` deletes when the session ends. Sessions can also share a named venv. See [SKILL.md](SKILL.md) for the full API.
+
+```bash
+pysess new -t 60 -c 'import pysess; pysess.venv.install("httpx"); import httpx'
+```
+
+## Session Logging
+
+Set `PYSESS_LOG_DIR` to record each session's executed cells, output, and tracebacks as a Python REPL transcript (`<YYYYMMDD-HHMMSS>-<ID>.log`). `pysess` creates the directory automatically if it does not exist.
+
+```bash
+export PYSESS_LOG_DIR="/tmp/pysess-$(id -u)/logs"
+
+pysess new -n audited-session -c "x = 40
+y = 2"
+pysess exec audited-session -c "x + y"
+pysess exec audited-session -c "for i in range(2):
+    print(i)"
+```
+
+Example `/tmp/pysess-<uid>/logs/20261117-202636-audited-session.log`:
+
+```python
+# pysess 2026-11-17T20:26:36+02:00
+>>> x = 40
+... y = 2
+# pysess 2026-11-17T20:26:37+02:00
+>>> x + y
+42
+# pysess 2026-11-17T20:26:38+02:00
+>>> for i in range(2):
+...     print(i)
+0
+1
+```
+
+## Configuration
+
+| Environment variable | Default | Description |
+| --- | --- | --- |
+| `PYSESS_RUNTIME_DIR` | `/tmp/pysess-<uid>` | Directory for session sockets and venvs. `pysess` creates it automatically with mode `0700`, and the current user must own it. Only `pysess` commands that use the same directory can see its sessions. |
+| `PYSESS_IDLE_TIMEOUT` | `3600` | Seconds of inactivity before a session exits. Set to `0` or a negative number to disable. |
+| `PYSESS_LOG_DIR` | unset (no logging) | Directory for session transcripts. See [Session Logging](#session-logging). |
+| `PYSESS_UV` | `uv` from `PATH` | `uv` executable used by `pysess.venv`. |
+| [`UV_CACHE_DIR`](https://docs.astral.sh/uv/reference/environment/#uv_cache_dir) | `~/.cache/uv` | Used directly by `uv`, not `pysess`. Sets where `uv` stores its download and wheel cache when installing packages. |
+
+## Directory Structure
+
+| Path | Content | Lifetime |
+| --- | --- | --- |
+| `/tmp/pysess-<uid>/<id>.sock` | Unix domain socket for session `<id>` | Until the session ends |
+| `/tmp/pysess-<uid>/sessions/<id>/venv/` | Private venv for session `<id>` | Until the session ends |
+| `/tmp/pysess-<uid>/venvs/<name>/` | Shared venv `<name>` | Until `pysess venv rm <name>`, or until the OS clears `/tmp` |
+| `$PYSESS_LOG_DIR/<YYYYMMDD-HHMMSS>-<id>.log` | Session transcript (when `PYSESS_LOG_DIR` is set) | Kept after `pysess kill` |
+| `~/.cache/uv/` | Download and wheel cache written by `uv` | Managed by `uv` |
+
+## Development
+
+Run the CLI and development checks with [`uv`](https://docs.astral.sh/uv/):
+
+```bash
+# Install dev tools (pytest, ruff, ty)
 uv sync
 
 # Run the CLI
