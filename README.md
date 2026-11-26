@@ -1,4 +1,7 @@
-# pysess
+<p align="center">
+  <img src="assets/logo-light.svg#gh-light-mode-only" alt="pysess" width="200">
+  <img src="assets/logo-dark.svg#gh-dark-mode-only" alt="pysess" width="200">
+</p>
 
 Persistent Python REPL sessions for coding agents.
 
