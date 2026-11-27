@@ -37,6 +37,7 @@ uv tool uninstall pysess
 | `pysess wait ID [-t SEC]` | Wait for a background step in `ID` up to `-t`/`--timeout` (default `30`s; `-t 0` to poll). |
 | `pysess cancel ID` | Interrupt the running step in `ID` with `KeyboardInterrupt` and keep the session state. |
 | `pysess ps [ID]` | List active sessions, or inspect `ID` for state, running location, idle time, and variables. |
+| `pysess logs ID [-f] [--tail N]` | Show or follow (`-f`) session `ID`'s live REPL transcript (`--tail N` for last `N` lines). |
 | `pysess kill [ID \| --all]` | Stop session `ID` (or all sessions with `--all`) and remove socket files. |
 | `pysess venv ls` | List venvs created with the `pysess.venv` Python API, including Python version, size, and packages. |
 | `pysess venv rm NAME... \| --all` | Remove shared venvs, or private venvs from dead sessions. |
@@ -63,32 +64,16 @@ pysess new -t 60 -c 'import pysess; pysess.venv.install("httpx"); import httpx'
 
 ## Session Logging
 
-Set `PYSESS_LOG_DIR` to record each session's executed cells, output, and tracebacks as a Python REPL transcript (`<YYYYMMDD-HHMMSS>-<ID>.log`). `pysess` creates the directory automatically if it does not exist.
+Every active session records its executed cells, output, and tracebacks in an ephemeral REPL transcript that is freed automatically when the session exits. View or follow it live with `pysess logs` (colorized automatically on a TTY; respects `NO_COLOR` and `FORCE_COLOR`). To also keep transcripts on disk after a session exits, set `PYSESS_LOG_DIR` (writes `<YYYYMMDD-HHMMSS>-<ID>.log`).
 
 ```bash
-export PYSESS_LOG_DIR="/tmp/pysess-$(id -u)/logs"
-
-pysess new -n audited-session -c "x = 40
-y = 2"
-pysess exec audited-session -c "x + y"
-pysess exec audited-session -c "for i in range(2):
-    print(i)"
-```
-
-Example `/tmp/pysess-<uid>/logs/20261117-202636-audited-session.log`:
-
-```python
-# pysess 2026-11-17T20:26:36+02:00
->>> x = 40
-... y = 2
-# pysess 2026-11-17T20:26:37+02:00
->>> x + y
-42
-# pysess 2026-11-17T20:26:38+02:00
->>> for i in range(2):
-...     print(i)
-0
-1
+pysess logs my-session -f   # stream live (add --tail N for the last N lines)
+# # pysess 2026-11-17T20:26:36+02:00
+# >>> x = 40
+# ... y = 2
+# # pysess 2026-11-17T20:26:37+02:00
+# >>> x + y
+# 42
 ```
 
 ## Configuration
@@ -97,7 +82,7 @@ Example `/tmp/pysess-<uid>/logs/20261117-202636-audited-session.log`:
 | --- | --- | --- |
 | `PYSESS_RUNTIME_DIR` | `/tmp/pysess-<uid>` | Directory for session sockets and venvs. `pysess` creates it automatically with mode `0700`, and the current user must own it. Only `pysess` commands that use the same directory can see its sessions. |
 | `PYSESS_IDLE_TIMEOUT` | `3600` | Seconds of inactivity before a session exits. Set to `0` or a negative number to disable. |
-| `PYSESS_LOG_DIR` | unset (no logging) | Directory for session transcripts. See [Session Logging](#session-logging). |
+| `PYSESS_LOG_DIR` | unset | Directory for persistent session transcripts (`<YYYYMMDD-HHMMSS>-<id>.log`) kept after a session exits. |
 | `PYSESS_UV` | `uv` from `PATH` | `uv` executable used by `pysess.venv`. |
 | [`UV_CACHE_DIR`](https://docs.astral.sh/uv/reference/environment/#uv_cache_dir) | `~/.cache/uv` | Used directly by `uv`, not `pysess`. Sets where `uv` stores its download and wheel cache when installing packages. |
 

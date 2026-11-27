@@ -70,16 +70,26 @@ def is_socket_alive(sock_path: Path) -> bool:
         return False
 
 
-def send_request(session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    """Send one JSON request to session `session_id` and return its JSON response."""
+def _connect(session_id: str, timeout: float) -> socket.socket:
+    """Connect to session `session_id`'s Unix socket with `timeout`."""
     sock_path = socket_path(session_id)
     if not sock_path.exists():
         raise Error(f"Session '{session_id}' not found.")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout)
+        sock.connect(str(sock_path))
+    except OSError as exc:
+        sock.close()
+        raise Error(f"Session '{session_id}' is unreachable ({exc}).") from exc
+    return sock
+
+
+def send_request(session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Send one JSON request to session `session_id` and return its JSON response."""
     req_timeout = max(0.0, float(payload.get("timeout", 0.0)))
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(req_timeout + 5.0)
-            sock.connect(str(sock_path))
+        with _connect(session_id, req_timeout + 5.0) as sock:
             sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
             with sock.makefile("r", encoding="utf-8") as reader:
                 line = reader.readline()
@@ -89,6 +99,27 @@ def send_request(session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     if not line:
         raise Error(f"Session '{session_id}' closed connection without a response.")
     return json.loads(line)
+
+
+def stream_request(session_id: str, payload: dict[str, Any]) -> Iterator[bytes]:
+    """Send one JSON request, verify an `ok` header line, then yield raw streamed bytes."""
+    with _connect(session_id, 5.0) as sock, sock.makefile("rb") as reader:
+        try:
+            sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            header = reader.readline()
+        except OSError as exc:
+            raise Error(f"Session '{session_id}' is unreachable ({exc}).") from exc
+
+        if not header:
+            raise Error(f"Session '{session_id}' closed connection without a response.")
+        resp = json.loads(header.decode("utf-8"))
+        if resp.get("status") != "ok":
+            raise Error(resp.get("error") or f"Session '{session_id}' returned error.")
+
+        sock.settimeout(None)
+        with contextlib.suppress(OSError):
+            while data := reader.read1(65536):
+                yield data
 
 
 def live_sessions() -> Iterator[dict[str, Any]]:

@@ -581,3 +581,117 @@ def test_reassigned_sys_streams_are_restored_after_step(runtime_env: dict[str, s
         assert res.stdout == "a\nb\nc"
     finally:
         _run_cli("kill", "streams", env=runtime_env)
+
+
+def test_logs_shows_transcript_and_tail(runtime_env: dict[str, str]) -> None:
+    res = _run_cli("new", "-n", "logview", "-c", "x = 40\ny = 2\n", env=runtime_env)
+    assert res.returncode == 0, res.stderr
+    try:
+        assert _run_cli("exec", "logview", "-c", "x + y", env=runtime_env).returncode == 0
+        assert _run_cli("exec", "logview", "-c", "print('hello')", env=runtime_env).returncode == 0
+
+        # Ephemeral transcript uses an unlinked file: no .log files in runtime_dir.
+        assert list(Path(runtime_env["PYSESS_RUNTIME_DIR"]).rglob("*.log")) == []
+
+        logs = _run_cli("logs", "logview", env=runtime_env)
+        assert logs.returncode == 0, logs.stderr
+        assert ">>> x = 40\n... y = 2\n" in logs.stdout
+        assert ">>> x + y\n42\n" in logs.stdout
+        assert ">>> print('hello')\nhello\n" in logs.stdout
+
+        tailed = _run_cli("logs", "logview", "--tail", "2", env=runtime_env)
+        assert tailed.returncode == 0, tailed.stderr
+        assert tailed.stdout == ">>> print('hello')\nhello\n"
+
+        zero = _run_cli("logs", "logview", "--tail", "0", env=runtime_env)
+        assert zero.returncode == 0, zero.stderr
+        assert zero.stdout == ""
+
+        neg = _run_cli("logs", "logview", "--tail", "-1", env=runtime_env)
+        assert neg.returncode == 2
+        assert "must be >= 0" in neg.stderr
+    finally:
+        _run_cli("kill", "logview", env=runtime_env)
+
+    missing = _run_cli("logs", "logview", env=runtime_env)
+    assert missing.returncode == 1
+    assert "not found" in missing.stderr
+
+
+def test_logs_follow_streams_live_output_and_exits_on_kill(runtime_env: dict[str, str]) -> None:
+    res = _run_cli("new", "-n", "live", "-c", "import time", env=runtime_env)
+    assert res.returncode == 0, res.stderr
+    follower = subprocess.Popen(
+        [sys.executable, "-m", "pysess", "logs", "live", "-f", "--tail", "0"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=runtime_env,
+    )
+    try:
+        # Give the follower a moment to attach before starting the slow detached step.
+        time.sleep(0.15)
+        step = _run_cli(
+            "exec",
+            "live",
+            "-d",
+            "-c",
+            "print('tick-1', flush=True)\ntime.sleep(0.6)\nprint('tick-2', flush=True)",
+            env=runtime_env,
+        )
+        assert step.returncode == 0, step.stderr
+
+        # Read lines as they stream: tick-1 must arrive while the step is still sleeping.
+        assert follower.stdout is not None
+        seen: list[str] = []
+        t0 = time.monotonic()
+        while True:
+            line = follower.stdout.readline()
+            assert line != "", "follower closed before tick-1"
+            seen.append(line.rstrip("\n"))
+            if "tick-1" in line:
+                break
+        assert time.monotonic() - t0 < 0.5, f"tick-1 arrived too late: {seen}"
+
+        wait_res = _run_cli("wait", "live", "-t", "5", env=runtime_env)
+        assert wait_res.returncode == 0, wait_res.stderr
+        _run_cli("kill", "live", env=runtime_env)
+
+        rest, stderr = follower.communicate(timeout=5)
+        assert follower.returncode == 0, stderr
+        full = "\n".join(seen) + "\n" + rest
+        assert "tick-1" in full
+        assert "tick-2" in full
+    finally:
+        if follower.poll() is None:
+            follower.kill()
+            follower.wait(timeout=2)
+        _run_cli("kill", "live", env=runtime_env)
+
+
+def test_logs_color_formatting(runtime_env: dict[str, str]) -> None:
+    res = _run_cli("new", "-n", "colorlog", "-c", "print('plain')", env=runtime_env)
+    assert res.returncode == 0, res.stderr
+    try:
+        assert _run_cli("exec", "colorlog", "-c", "1 / 0", env=runtime_env).returncode == 1
+
+        # Default on non-TTY pipe emits plain text with no ANSI codes.
+        plain = _run_cli("logs", "colorlog", env=runtime_env)
+        assert plain.returncode == 0, plain.stderr
+        assert "\033[" not in plain.stdout
+
+        # FORCE_COLOR enables ANSI styling; NO_COLOR overrides FORCE_COLOR.
+        colored = _run_cli("logs", "colorlog", env={**runtime_env, "FORCE_COLOR": "1"})
+        assert colored.returncode == 0, colored.stderr
+        assert "\033[2m# pysess " in colored.stdout
+        assert "\033[1;36m>>>\033[0m\033[1m print('plain')\033[0m\nplain\n" in colored.stdout
+        assert "\033[31mTraceback (most recent call last):\033[0m\n" in colored.stdout
+        assert "\033[1;31mZeroDivisionError: division by zero\033[0m\n" in colored.stdout
+
+        disabled = _run_cli(
+            "logs", "colorlog", env={**runtime_env, "FORCE_COLOR": "1", "NO_COLOR": "1"}
+        )
+        assert disabled.returncode == 0, disabled.stderr
+        assert "\033[" not in disabled.stdout
+    finally:
+        _run_cli("kill", "colorlog", env=runtime_env)

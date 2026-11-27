@@ -36,6 +36,7 @@ from pysess._runtime import (
     runtime_dir,
     send_request,
     socket_path,
+    stream_request,
 )
 
 DEFAULT_EXEC_TIMEOUT = 10.0
@@ -81,39 +82,112 @@ def _format_repl_cell(code: str) -> str:
 
 
 class _SessionLog:
-    """Thread-safe append-only REPL transcript writer for a session."""
+    """Thread-safe append-only REPL transcript backed by an unlinked temp file.
 
-    def __init__(self, log_path: Path) -> None:
-        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        self._file = os.fdopen(fd, "w", encoding="utf-8")
-        self._lock = threading.Lock()
+    The unlinked file in `runtime_dir` is freed automatically by the kernel when the daemon
+    exits (even on `SIGKILL`). If `audit_path` is provided (via `PYSESS_LOG_DIR`), writes are
+    also teed to that persistent file.
+    """
+
+    def __init__(self, directory: Path, audit_path: Path | None = None) -> None:
+        self._tmp = tempfile.TemporaryFile(dir=directory)  # noqa: SIM115 - lives with daemon
+        self._tmp_fd = self._tmp.fileno()
+        self._audit_file: io.TextIOWrapper | None = None
+        if audit_path is not None:
+            fd = os.open(audit_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            self._audit_file = os.fdopen(fd, "w", encoding="utf-8")
+        self._cond = threading.Condition()
+        self._size = 0
         self._at_bol = True
+        self._finished = False
 
     def write(self, text: str, *, ensure_bol: bool = False) -> None:
         if not text:
             return
-        with self._lock:
-            if self._file.closed:
+        with self._cond:
+            if self._finished:
                 return
             if ensure_bol and not self._at_bol:
-                self._file.write("\n")
-            self._file.write(text)
-            self._file.flush()
+                text = "\n" + text
+            data = text.encode("utf-8")
+            self._tmp.write(data)
+            self._tmp.flush()
+            self._size += len(data)
+            if self._audit_file is not None and not self._audit_file.closed:
+                self._audit_file.write(text)
+                self._audit_file.flush()
             self._at_bol = text.endswith("\n")
+            self._cond.notify_all()
 
-    def close(self) -> None:
-        with self._lock, contextlib.suppress(OSError):
-            self._file.close()
+    def tail_offset(self, lines: int | None) -> int:
+        """Return the byte offset for the last `lines` lines (or 0 if `lines` is `None`)."""
+        with self._cond:
+            size = self._size
+        if lines is None:
+            return 0
+        if lines <= 0 or size == 0:
+            return size
+        # Ignore a single trailing newline so `--tail 1` returns the last non-empty line.
+        pos = size - 1 if os.pread(self._tmp_fd, 1, size - 1) == b"\n" else size
+        found = 0
+        while pos > 0:
+            start = max(0, pos - 65536)
+            chunk = os.pread(self._tmp_fd, pos - start, start)
+            idx = len(chunk)
+            while (idx := chunk.rfind(b"\n", 0, idx)) != -1:
+                found += 1
+                if found == lines:
+                    return start + idx + 1
+            pos = start
+        return 0
+
+    def read_from(self, offset: int) -> tuple[bytes, int]:
+        """Return all bytes written since `offset` along with the new offset."""
+        with self._cond:
+            size = self._size
+        chunks: list[bytes] = []
+        pos = offset
+        while pos < size:
+            chunk = os.pread(self._tmp_fd, min(65536, size - pos), pos)
+            if not chunk:
+                break
+            pos += len(chunk)
+            chunks.append(chunk)
+        return b"".join(chunks), pos
+
+    def wait_for_data(self, offset: int, timeout: float) -> bool:
+        """Wait until new bytes appear past `offset`, the log finishes, or `timeout` elapses.
+
+        Returns `True` if the log is finished and no unread bytes remain.
+        """
+        with self._cond:
+            if self._size > offset:
+                return False
+            if self._finished:
+                return True
+            self._cond.wait(timeout=timeout)
+            return self._finished and self._size <= offset
+
+    def finish(self) -> None:
+        """Mark the transcript finished, close the audit file, and wake all followers."""
+        with self._cond:
+            self._finished = True
+            # Keep `self._tmp` open until process exit so in-flight readers never hit EBADF.
+            if self._audit_file is not None:
+                with contextlib.suppress(OSError):
+                    self._audit_file.close()
+            self._cond.notify_all()
 
 
-def _open_session_log(session_id: str) -> _SessionLog | None:
-    """Open a timestamped REPL log file if `PYSESS_LOG_DIR` is set."""
-    if not (raw := os.environ.get("PYSESS_LOG_DIR", "").strip()):
-        return None
-    base = Path(raw)
-    base.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")  # local time
-    return _SessionLog(base / f"{stamp}-{session_id}.log")
+def _open_session_log(session_id: str, directory: Path) -> _SessionLog:
+    """Open the session's ephemeral transcript, plus an audit file if `PYSESS_LOG_DIR` is set."""
+    audit_path: Path | None = None
+    if raw := os.environ.get("PYSESS_LOG_DIR", "").strip():
+        base = Path(raw)
+        base.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")  # local time
+        audit_path = base / f"{stamp}-{session_id}.log"
+    return _SessionLog(directory, audit_path=audit_path)
 
 
 def _redirect_fd_to_unlinked_file(fd: int, directory: Path) -> None:
@@ -247,7 +321,6 @@ class SessionDaemon:
         self.session_id = session_id
         self.sock_path = sock_path
         self.idle_timeout = idle_timeout_seconds()
-        self.session_log: _SessionLog | None = None
 
         main_module = types.ModuleType("__main__")
         main_module.__dict__["__builtins__"] = builtins
@@ -275,7 +348,7 @@ class SessionDaemon:
         self.sock_path.chmod(0o600)
         self._server_sock.listen(16)
         self._server_sock.settimeout(0.5)
-        self.session_log = _open_session_log(session_id)
+        self.session_log = _open_session_log(session_id, self.sock_path.parent)
         venv._session_started(session_id)
 
         # File descriptors 1 and 2 are inherited by child processes. Point them at files
@@ -298,13 +371,12 @@ class SessionDaemon:
         return {"stdout_delta": self._stdout.read(), "stderr_delta": self._stderr.read()}
 
     def _log_output(self) -> None:
-        if self.session_log is not None:
-            self.session_log.write(self._log_stdout.read())
-            self.session_log.write(self._log_stderr.read())
+        self.session_log.write(self._log_stdout.read())
+        self.session_log.write(self._log_stderr.read())
 
     def _cleanup(self) -> None:
-        if self.session_log is not None:
-            self.session_log.close()
+        self._log_output()
+        self.session_log.finish()
         with contextlib.suppress(OSError):
             self._server_sock.close()
         with contextlib.suppress(OSError):
@@ -338,6 +410,9 @@ class SessionDaemon:
                 if not line:
                     return
                 req = json.loads(line)
+                if req.get("op") == "logs":
+                    self._handle_logs(conn, req)
+                    return
                 resp, job_to_notify = self._dispatch(req)
                 kill_after_reply = req.get("op") == "kill" and resp.get("status") == "killed"
             except Exception as exc:  # noqa: BLE001 - report any request failure to the client
@@ -348,6 +423,24 @@ class SessionDaemon:
             job_to_notify.delivered_event.set()
         if kill_after_reply:
             self._initiate_kill()
+
+    def _handle_logs(self, conn: socket.socket, req: dict[str, Any]) -> None:
+        follow = bool(req.get("follow", False))
+        raw_tail = req.get("tail")
+        tail = int(raw_tail) if raw_tail is not None else None
+        self._log_output()
+        offset = self.session_log.tail_offset(tail)
+        with contextlib.suppress(OSError):
+            conn.sendall(b'{"status": "ok"}\n')
+            while True:
+                data, offset = self.session_log.read_from(offset)
+                if data:
+                    conn.sendall(data)
+                if not follow:
+                    break
+                if self.session_log.wait_for_data(offset, timeout=0.1):
+                    break
+                self._log_output()
 
     def _job_response(self, job: _Job) -> tuple[dict[str, Any], _Job | None]:
         if not job.done_event.is_set():
@@ -505,13 +598,12 @@ class SessionDaemon:
                     break
 
                 exited_via_sys_exit = False
-                if self.session_log is not None:
-                    self._log_output()  # written by child processes or threads since last step
-                    ts = datetime.now().astimezone().isoformat(timespec="seconds")
-                    self.session_log.write(
-                        f"# pysess {ts}\n{_format_repl_cell(job.code)}",
-                        ensure_bol=True,
-                    )
+                self._log_output()  # written by child processes or threads since last step
+                ts = datetime.now().astimezone().isoformat(timespec="seconds")
+                self.session_log.write(
+                    f"# pysess {ts}\n{_format_repl_cell(job.code)}",
+                    ensure_bol=True,
+                )
                 try:
                     self._in_user_code = True
                     if job.cancel_requested:
@@ -540,7 +632,7 @@ class SessionDaemon:
                     # Undo reassignments of `sys.stdout`/`sys.stderr` by the step.
                     sys.stdout, sys.stderr = self._real_stdout, self._real_stderr
                     self._log_output()
-                    if self.session_log is not None and job.expr_repr is not None:
+                    if job.expr_repr is not None:
                         self.session_log.write(f"{job.expr_repr}\n", ensure_bol=True)
                     with self.state_lock:
                         self.last_activity = time.monotonic()
@@ -594,6 +686,64 @@ def _read_code(code_arg: str | None, file_arg: str | None, *, read_stdin_tty_saf
     if read_stdin_tty_safe and sys.stdin.isatty():
         return ""
     return sys.stdin.read()
+
+
+def _use_color() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    return bool(os.environ.get("FORCE_COLOR")) or sys.stdout.isatty()
+
+
+class _LogColorizer:
+    """Incremental ANSI colorizer for streamed REPL transcript bytes."""
+
+    def __init__(self) -> None:
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._buf = ""
+        self._at_bol = True
+        self._in_traceback = False
+
+    def _color_line(self, line: str) -> str:
+        body = line.rstrip("\r\n")
+        eol = line[len(body) :]
+        if body.startswith("# pysess "):
+            self._in_traceback = False
+            return f"\033[2m{body}\033[0m{eol}"
+        if body in (">>>", "...") or body.startswith((">>> ", "... ")):
+            self._in_traceback = False
+            rest = f"\033[1m{body[3:]}\033[0m" if len(body) > 3 else ""
+            return f"\033[1;36m{body[:3]}\033[0m{rest}{eol}"
+        if body == "Traceback (most recent call last):":
+            self._in_traceback = True
+            return f"\033[31m{body}\033[0m{eol}"
+        if self._in_traceback:
+            if not body or body.startswith("  "):
+                return f"\033[31m{body}\033[0m{eol}" if body else line
+            self._in_traceback = False
+            return f"\033[1;31m{body}\033[0m{eol}"
+        return line
+
+    def feed(self, chunk: bytes) -> str:
+        text = self._buf + self._decoder.decode(chunk)
+        self._buf = ""
+        out: list[str] = []
+        for piece in text.splitlines(keepends=True):
+            if piece.endswith(("\n", "\r")):
+                out.append(self._color_line(piece) if self._at_bol else piece)
+                self._at_bol = True
+            elif not self._at_bol:
+                out.append(piece)
+            elif self._in_traceback or piece[0] in "#>.T":
+                self._buf = piece
+            else:
+                out.append(piece)
+                self._at_bol = False
+        return "".join(out)
+
+    def flush(self) -> str:
+        tail = self._buf + self._decoder.decode(b"", final=True)
+        self._buf = ""
+        return self._color_line(tail) if tail and self._at_bol else tail
 
 
 def _format_idle_duration(seconds: float) -> str:
@@ -706,6 +856,13 @@ def _emit_step_output(session_id: str, resp: dict[str, Any]) -> int:
     return 0
 
 
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return parsed
+
+
 def _add_code_source_args(parser: argparse.ArgumentParser) -> None:
     group = parser.add_mutually_exclusive_group()
     group.add_argument("-c", "--code", dest="code", help="Python code string to execute.")
@@ -745,6 +902,7 @@ def build_parser() -> argparse.ArgumentParser:
             '  pysess exec <id> -c "x + 2"    # run in the same session (prints 42)\n'
             "  pysess exec <id> <<'EOF'       # run multiline code from stdin\n"
             "  pysess ps                      # list active sessions\n"
+            "  pysess logs <id> -f            # follow session transcript live\n"
             "  pysess kill <id>               # stop session (or --all)"
         ),
     )
@@ -799,6 +957,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="List active sessions or inspect a session's state.",
     )
     ps_parser.add_argument("session_id", nargs="?", metavar="ID", help="Optional session ID.")
+
+    logs_parser = subparsers.add_parser(
+        "logs",
+        help="Show or follow a session's REPL transcript.",
+    )
+    logs_parser.add_argument("session_id", metavar="ID", help="Target session ID.")
+    logs_parser.add_argument(
+        "-f",
+        "--follow",
+        action="store_true",
+        help="Stream new transcript output live until the session exits or Ctrl-C.",
+    )
+    logs_parser.add_argument(
+        "--tail",
+        type=_non_negative_int,
+        default=None,
+        metavar="N",
+        help="Lines of recent transcript to display (default: all).",
+    )
 
     kill_parser = subparsers.add_parser(
         "kill",
@@ -962,6 +1139,26 @@ def main(argv: list[str] | None = None) -> None:
                         print(line)
                 else:
                     print("No active sessions.")
+            rc = 0
+        elif args.command == "logs":
+            payload: dict[str, Any] = {"op": "logs", "follow": args.follow}
+            if args.tail is not None:
+                payload["tail"] = args.tail
+            colorizer = _LogColorizer() if _use_color() else None
+            try:
+                for chunk in stream_request(args.session_id, payload):
+                    if colorizer is not None:
+                        if rendered := colorizer.feed(chunk):
+                            sys.stdout.write(rendered)
+                            sys.stdout.flush()
+                    else:
+                        sys.stdout.buffer.write(chunk)
+                        sys.stdout.buffer.flush()
+                if colorizer is not None and (tail := colorizer.flush()):
+                    sys.stdout.write(tail)
+                    sys.stdout.flush()
+            except KeyboardInterrupt:
+                pass
             rc = 0
         elif args.command == "venv":
             rc = _cmd_venv(args)
